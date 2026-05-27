@@ -2200,6 +2200,8 @@
                             <option value="32">True Color (32)</option>
                             <option value="48">True Color (48)</option>
                             <option value="64">True Color (64)</option>
+                            <option value="128">True Color (128)</option>
+                            <option value="256">True Color (256)</option>
                             <option value="infinite">No limit</option>
                         </select>
                     </div>
