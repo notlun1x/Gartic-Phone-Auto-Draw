@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gartic Phone DrawBot
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Automated drawing bot with WebSocket interception, image loading, color quantization, preview and progress indicator
 // @author       NotLun1x
 // @match        https://garticphone.com/*
@@ -82,6 +82,23 @@
     let isPaused = false;
     let currentImageSrc = '';
     let strokeIdCounter = 1;
+
+    // --- Layout and Custom Scale State ---
+    let layoutMode = 'stretch'; // 'stretch', 'center', 'custom'
+    let customX = 0;   // 0 to 768
+    let customY = 0;   // 0 to 448
+    let customW = 384; // default width
+    let customH = 224; // default height
+    let draftImg = null;
+    let isDraggingImage = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let imgStartX = 0;
+    let imgStartY = 0;
+    let imgStartW = 0;
+    let imgStartH = 0;
+    let activeDragAction = null; // 'move', 'resize-TL', 'resize-TR', 'resize-BL', 'resize-BR'
+    let isApplied = false;
 
     const GARTIC_PALETTE = [
         { r: 0, g: 0, b: 0 },         // Black
@@ -255,6 +272,214 @@
             setTimeout(resolve, ms);
         }
     });
+
+    function clampCustomBounds() {
+        customW = Math.max(10, Math.min(768, customW));
+        customH = Math.max(10, Math.min(448, customH));
+        customX = Math.max(0, Math.min(768 - customW, customX));
+        customY = Math.max(0, Math.min(448 - customH, customY));
+    }
+
+    function updateSliders() {
+        const wSlider = document.getElementById('db-custom-w');
+        const hSlider = document.getElementById('db-custom-h');
+        const xSlider = document.getElementById('db-custom-x');
+        const ySlider = document.getElementById('db-custom-y');
+        
+        if (wSlider) {
+            wSlider.value = customW;
+            document.getElementById('db-val-w').textContent = Math.round(customW);
+        }
+        if (hSlider) {
+            hSlider.value = customH;
+            document.getElementById('db-val-h').textContent = Math.round(customH);
+        }
+        if (xSlider) {
+            xSlider.max = 768 - customW;
+            xSlider.value = customX;
+            document.getElementById('db-val-x').textContent = Math.round(customX);
+        }
+        if (ySlider) {
+            ySlider.max = 448 - customH;
+            ySlider.value = customY;
+            document.getElementById('db-val-y').textContent = Math.round(customY);
+        }
+    }
+
+    function drawDraftPreview() {
+        const pCanvas = document.getElementById('db-preview-canvas');
+        if (!pCanvas || !currentImageSrc) return;
+        const pContainer = document.getElementById('db-preview-container');
+        if (pContainer) {
+            pContainer.style.display = 'flex';
+        }
+        const step = parseInt(document.getElementById('db-scale').value, 10);
+        const w = Math.round(768 / step);
+        const h = Math.round(448 / step);
+        pCanvas.width = w;
+        pCanvas.height = h;
+        const ctx = pCanvas.getContext('2d');
+        ctx.clearRect(0, 0, w, h);
+        
+        // Draw faint outline of the Gartic Phone drawing boundaries
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0, 0, w, h);
+        
+        if (draftImg && draftImg.complete) {
+            const cx = customX / step;
+            const cy = customY / step;
+            const cw = customW / step;
+            const ch = customH / step;
+            ctx.drawImage(draftImg, cx, cy, cw, ch);
+            
+            // Bounding box border
+            ctx.strokeStyle = '#8b5cf6';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(cx, cy, cw, ch);
+            
+            // Corner handles (constant visual size of 12px on screen, so half-size is 6px on screen)
+            ctx.fillStyle = '#8b5cf6';
+            const rect = pCanvas.getBoundingClientRect();
+            const hs = (6 * w) / rect.width;
+            
+            ctx.fillRect(cx - hs, cy - hs, hs * 2, hs * 2); // TL
+            ctx.fillRect(cx + cw - hs, cy - hs, hs * 2, hs * 2); // TR
+            ctx.fillRect(cx - hs, cy + ch - hs, hs * 2, hs * 2); // BL
+            ctx.fillRect(cx + cw - hs, cy + ch - hs, hs * 2, hs * 2); // BR
+        }
+        
+        const infoEl = document.getElementById('db-preview-info');
+        if (infoEl) {
+            infoEl.innerHTML = `<span style="color: #fbbf24; font-weight: bold;">[Draft Mode] Drag corners to resize or body to move.<br>Click "Apply & Render Preview" to verify drawing.</span>`;
+        }
+    }
+
+    function handleCanvasMouseDown(e) {
+        if (layoutMode !== 'custom' || !draftImg) return;
+        const pCanvas = document.getElementById('db-preview-canvas');
+        if (!pCanvas) return;
+        const rect = pCanvas.getBoundingClientRect();
+        
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        
+        const workX = (mouseX / rect.width) * 768;
+        const workY = (mouseY / rect.height) * 448;
+        
+        // Grab threshold of 24 screen pixels (extremely easy to grab corners):
+        const handleThreshold = 24 * (768 / rect.width);
+        
+        const distTL = Math.hypot(workX - customX, workY - customY);
+        const distTR = Math.hypot(workX - (customX + customW), workY - customY);
+        const distBL = Math.hypot(workX - customX, workY - (customY + customH));
+        const distBR = Math.hypot(workX - (customX + customW), workY - (customY + customH));
+        
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+        imgStartX = customX;
+        imgStartY = customY;
+        imgStartW = customW;
+        imgStartH = customH;
+        
+        if (distTL < handleThreshold) {
+            activeDragAction = 'resize-TL';
+        } else if (distTR < handleThreshold) {
+            activeDragAction = 'resize-TR';
+        } else if (distBL < handleThreshold) {
+            activeDragAction = 'resize-BL';
+        } else if (distBR < handleThreshold) {
+            activeDragAction = 'resize-BR';
+        } else if (workX >= customX && workX <= customX + customW &&
+                   workY >= customY && workY <= customY + customH) {
+            activeDragAction = 'move';
+        } else {
+            activeDragAction = null;
+            return;
+        }
+        
+        isDraggingImage = true;
+        document.addEventListener('mousemove', handleCanvasMouseMove);
+        document.addEventListener('mouseup', handleCanvasMouseUp);
+    }
+
+    function handleCanvasMouseMove(e) {
+        if (!isDraggingImage || !activeDragAction) return;
+        const pCanvas = document.getElementById('db-preview-canvas');
+        if (!pCanvas) return;
+        const rect = pCanvas.getBoundingClientRect();
+        
+        const deltaPageX = e.clientX - dragStartX;
+        const deltaPageY = e.clientY - dragStartY;
+        
+        const deltaX = (deltaPageX / rect.width) * 768;
+        const deltaY = (deltaPageY / rect.height) * 448;
+        
+        if (activeDragAction === 'move') {
+            customX = Math.max(0, Math.min(768 - customW, imgStartX + deltaX));
+            customY = Math.max(0, Math.min(448 - customH, imgStartY + deltaY));
+        } else if (activeDragAction === 'resize-BR') {
+            customW = Math.max(10, Math.min(768 - customX, imgStartW + deltaX));
+            customH = Math.max(10, Math.min(448 - customY, imgStartH + deltaY));
+        } else if (activeDragAction === 'resize-BL') {
+            customX = Math.max(0, Math.min(imgStartX + imgStartW - 10, imgStartX + deltaX));
+            customW = imgStartX + imgStartW - customX;
+            customH = Math.max(10, Math.min(448 - customY, imgStartH + deltaY));
+        } else if (activeDragAction === 'resize-TR') {
+            customY = Math.max(0, Math.min(imgStartY + imgStartH - 10, imgStartY + deltaY));
+            customH = imgStartY + imgStartH - customY;
+            customW = Math.max(10, Math.min(768 - customX, imgStartW + deltaX));
+        } else if (activeDragAction === 'resize-TL') {
+            customX = Math.max(0, Math.min(imgStartX + imgStartW - 10, imgStartX + deltaX));
+            customY = Math.max(0, Math.min(imgStartY + imgStartH - 10, imgStartY + deltaY));
+            customW = imgStartX + imgStartW - customX;
+            customH = imgStartY + imgStartH - customY;
+        }
+        
+        clampCustomBounds();
+        updateSliders();
+        drawDraftPreview();
+        isApplied = false;
+    }
+
+    function handleCanvasMouseUp() {
+        isDraggingImage = false;
+        activeDragAction = null;
+        document.removeEventListener('mousemove', handleCanvasMouseMove);
+        document.removeEventListener('mouseup', handleCanvasMouseUp);
+    }
+
+    function handleCanvasMouseMoveNoDrag(e) {
+        if (layoutMode !== 'custom' || isDraggingImage || !draftImg) return;
+        const pCanvas = document.getElementById('db-preview-canvas');
+        if (!pCanvas) return;
+        const rect = pCanvas.getBoundingClientRect();
+        
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        
+        const workX = (mouseX / rect.width) * 768;
+        const workY = (mouseY / rect.height) * 448;
+        
+        // Match hover cursor detection threshold (24 screen pixels):
+        const handleThreshold = 24 * (768 / rect.width);
+        
+        const distTL = Math.hypot(workX - customX, workY - customY);
+        const distTR = Math.hypot(workX - (customX + customW), workY - customY);
+        const distBL = Math.hypot(workX - customX, workY - (customY + customH));
+        const distBR = Math.hypot(workX - (customX + customW), workY - (customY + customH));
+        
+        if (distTL < handleThreshold || distBR < handleThreshold) {
+            pCanvas.style.cursor = 'nwse-resize';
+        } else if (distTR < handleThreshold || distBL < handleThreshold) {
+            pCanvas.style.cursor = 'nesw-resize';
+        } else if (workX >= customX && workX <= customX + customW &&
+                   workY >= customY && workY <= customY + customH) {
+            pCanvas.style.cursor = 'move';
+        } else {
+            pCanvas.style.cursor = 'default';
+        }
+    }
 
     function rgbToHex(r, g, b) {
         return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase();
@@ -1229,9 +1454,31 @@
         tempCanvas.width = w;
         tempCanvas.height = h;
         const ctx = tempCanvas.getContext('2d');
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, w, h);
-        ctx.drawImage(img, 0, 0, w, h);
+        ctx.clearRect(0, 0, w, h);
+        
+        if (layoutMode === 'stretch') {
+            ctx.drawImage(img, 0, 0, w, h);
+        } else if (layoutMode === 'center') {
+            const imgRatio = img.width / img.height;
+            const canvasRatio = 768 / 448;
+            let dw, dh, dx, dy;
+            if (imgRatio > canvasRatio) {
+                dw = w;
+                dh = w / imgRatio;
+            } else {
+                dh = h;
+                dw = h * imgRatio;
+            }
+            dx = (w - dw) / 2;
+            dy = (h - dh) / 2;
+            ctx.drawImage(img, dx, dy, dw, dh);
+        } else if (layoutMode === 'custom') {
+            const cx = customX / step;
+            const cy = customY / step;
+            const cw = customW / step;
+            const ch = customH / step;
+            ctx.drawImage(img, cx, cy, cw, ch);
+        }
 
         const imgData = ctx.getImageData(0, 0, w, h);
         const data = imgData.data;
@@ -1240,12 +1487,10 @@
         const colorCounts = new Map();
         for (let i = 0; i < data.length; i += 4) {
             const a = data[i + 3];
-            let rgbInt;
             if (a < 150) {
-                rgbInt = 0xFFFFFF; // White
-            } else {
-                rgbInt = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
+                continue; // Skip transparent/margins
             }
+            const rgbInt = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
             colorCounts.set(rgbInt, (colorCounts.get(rgbInt) || 0) + 1);
         }
 
@@ -1279,24 +1524,22 @@
             for (let x = 0; x < w; x++) {
                 const idx = (rowOffset + x) * 4;
                 const a = data[idx + 3];
-                let r, g, b;
                 if (a < 150) {
-                    r = 255; g = 255; b = 255;
+                    pixelIndices[rowOffset + x] = -1; // -1 represents transparent
                 } else {
-                    r = data[idx]; g = data[idx + 1]; b = data[idx + 2];
-                }
-
-                let closestIdx = 0;
-                let minDist = Infinity;
-                const p = { r, g, b };
-                for (let i = 0; i < palette.length; i++) {
-                    const dist = getDistance(p, palette[i]);
-                    if (dist < minDist) {
-                        minDist = dist;
-                        closestIdx = i;
+                    let r = data[idx]; let g = data[idx + 1]; let b = data[idx + 2];
+                    let closestIdx = 0;
+                    let minDist = Infinity;
+                    const p = { r, g, b };
+                    for (let i = 0; i < palette.length; i++) {
+                        const dist = getDistance(p, palette[i]);
+                        if (dist < minDist) {
+                            minDist = dist;
+                            closestIdx = i;
+                        }
                     }
+                    pixelIndices[rowOffset + x] = closestIdx;
                 }
-                pixelIndices[rowOffset + x] = closestIdx;
             }
         }
 
@@ -1308,7 +1551,7 @@
                 for (let x = 0; x < w; x++) {
                     const idx = rowOffset + x;
                     const colorIdx = pixelIndices[idx];
-                    if (colorIdx === whiteIdx) continue;
+                    if (colorIdx === -1 || colorIdx === whiteIdx) continue;
 
                     let sameNeighbors = 0;
                     for (let dx = -1; dx <= 1; dx++) {
@@ -1334,6 +1577,7 @@
                                 const ny = y + dy;
                                 if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
                                     const nIdx = pixelIndices[ny * w + nx];
+                                    if (nIdx === -1) continue; // Skip transparent neighbors/canvas margins
                                     const c = (counts.get(nIdx) || 0) + 1;
                                     counts.set(nIdx, c);
                                     if (c > maxCount) {
@@ -1362,7 +1606,8 @@
         const mappedGrid = Array(w).fill(null).map(() => Array(h).fill(null));
         for (let x = 0; x < w; x++) {
             for (let y = 0; y < h; y++) {
-                mappedGrid[x][y] = paletteHex[pixelIndices[y * w + x]];
+                const idx = pixelIndices[y * w + x];
+                mappedGrid[x][y] = (idx === -1) ? 'transparent' : paletteHex[idx];
             }
         }
 
@@ -1395,6 +1640,7 @@
             let maxCount = 0;
             let mostPopularColor = null;
             for (let c in counts) {
+                if (c === 'transparent') continue;
                 if (counts[c] > maxCount) {
                     maxCount = counts[c];
                     mostPopularColor = c;
@@ -1405,7 +1651,7 @@
             }
         }
 
-        const colorsToDraw = Array.from(colors).filter(c => c !== skippedColor);
+        const colorsToDraw = Array.from(colors).filter(c => c !== skippedColor && c !== 'transparent');
         let colorIndexGrid = null;
         if (drawMode === 'fill') {
             const islandCounts = new Map();
@@ -1509,6 +1755,7 @@
 
         try {
             const img = await loadImage(src);
+            draftImg = img;
             const step = parseInt(document.getElementById('db-scale').value, 10);
             const colorsMode = document.getElementById('db-colors-mode').value;
             const denoiseLevel = parseInt(document.getElementById('db-denoise-level').value, 10);
@@ -1535,12 +1782,19 @@
             for (let y = 0; y < processed.height; y++) {
                 for (let x = 0; x < processed.width; x++) {
                     const hex = processed.grid[x][y];
-                    const rgb = hexToRgb(hex);
                     const idx = (y * processed.width + x) * 4;
-                    pData[idx] = rgb.r;
-                    pData[idx + 1] = rgb.g;
-                    pData[idx + 2] = rgb.b;
-                    pData[idx + 3] = 255;
+                    if (hex === 'transparent') {
+                        pData[idx] = 0;
+                        pData[idx + 1] = 0;
+                        pData[idx + 2] = 0;
+                        pData[idx + 3] = 0;
+                    } else {
+                        const rgb = hexToRgb(hex);
+                        pData[idx] = rgb.r;
+                        pData[idx + 1] = rgb.g;
+                        pData[idx + 2] = rgb.b;
+                        pData[idx + 3] = 255;
+                    }
                 }
             }
             pCtx.putImageData(pImgData, 0, 0);
@@ -1556,9 +1810,11 @@
                 const estSec = Math.round((analysis.totalCommands * delay) / 1000);
                 infoEl.innerHTML = `Rects: <b>${analysis.rects}</b> | Lines: <b>${analysis.paths}</b><br>Draw time: <b>~${estSec}s</b>`;
             }
+            isApplied = true;
         } catch (e) {
             console.error(e);
             infoEl.textContent = 'Loading/preview error';
+            isApplied = false;
         }
     }
 
@@ -1693,6 +1949,17 @@
                 return;
             }
 
+            if (!isApplied) {
+                updateStatus('Applying & Rendering Preview...', '#fbbf24');
+                await processAndPreviewImage(currentImageSrc);
+                if (!isApplied) {
+                    updateStatus('❌ Preview render failed', '#ef4444');
+                    return;
+                }
+                // Small delay to let user see preview and est draw time before drawing begins
+                await sleep(1500);
+            }
+
             updateStatus('Processing...', '#fbbf24');
             const { grid, width, height } = processImage(img, step, colorsMode, denoiseLevel);
 
@@ -1715,6 +1982,7 @@
                 let maxCount = 0;
                 let mostPopularColor = null;
                 for (let c in counts) {
+                    if (c === 'transparent') continue;
                     if (counts[c] > maxCount) {
                         maxCount = counts[c];
                         mostPopularColor = c;
@@ -1765,7 +2033,7 @@
                 updateProgress();
             }
 
-            const colorsToDraw = Array.from(colors).filter(c => c !== skippedColor);
+            const colorsToDraw = Array.from(colors).filter(c => c !== skippedColor && c !== 'transparent');
             let colorIndexGrid = null;
             if (drawMode === 'fill') {
                 const islandCounts = new Map();
@@ -2081,7 +2349,12 @@
                 denoise: document.getElementById('db-denoise-level')?.value || '0',
                 fillBg: document.getElementById('db-fill-bg')?.checked ?? true,
                 useBridge: document.getElementById('db-use-bridge')?.checked ?? true,
-                bridgeLen: document.getElementById('db-bridge-len')?.value || '50'
+                bridgeLen: document.getElementById('db-bridge-len')?.value || '50',
+                layoutMode: layoutMode,
+                customX: customX,
+                customY: customY,
+                customW: customW,
+                customH: customH
             };
             localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
         } catch (e) {
@@ -2150,7 +2423,7 @@
             <div id="db-header" style="cursor: move; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 8px; margin-bottom: 12px;">
                 <div style="font-weight: 800; color: #a78bfa; font-size: 14px; display: flex; align-items: center; gap: 6px;">
                     <span class="pulse-dot"></span>
-                    DrawBot 1.0
+                    DrawBot 1.1
                 </div>
                 <button id="db-minimize-btn" style="background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 12px; transition: color 0.2s;">➖</button>
             </div>
@@ -2219,6 +2492,43 @@
                         <label style="display: block; margin-bottom: 4px; color: #94a3b8;">Rects per packet:</label>
                         <input type="number" id="db-batch-size" min="1" max="1000" value="3000" style="width: 100%; box-sizing: border-box; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
                     </div>
+                </div>
+
+                <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+                    <div style="flex: 1; font-size: 11px;">
+                        <label style="display: block; margin-bottom: 4px; color: #94a3b8;">Layout:</label>
+                        <select id="db-layout-mode" style="width: 100%; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; cursor: pointer;">
+                            <option value="stretch" selected>Stretch</option>
+                            <option value="center">Center</option>
+                            <option value="custom">Custom Scale</option>
+                        </select>
+                    </div>
+                    <div style="flex: 1; font-size: 11px;">
+                    </div>
+                </div>
+
+                <div id="db-custom-sliders" style="display: none; background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 8px; margin-bottom: 10px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; font-size: 10px;">
+                        <span style="color: #94a3b8;">Width:</span>
+                        <input type="range" id="db-custom-w" min="10" max="768" value="384" style="width: 120px; accent-color: #a78bfa;">
+                        <span id="db-val-w" style="color: #a78bfa; font-weight: bold; width: 30px; text-align: right;">384</span>
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; font-size: 10px;">
+                        <span style="color: #94a3b8;">Height:</span>
+                        <input type="range" id="db-custom-h" min="10" max="448" value="224" style="width: 120px; accent-color: #a78bfa;">
+                        <span id="db-val-h" style="color: #a78bfa; font-weight: bold; width: 30px; text-align: right;">224</span>
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; font-size: 10px;">
+                        <span style="color: #94a3b8;">X Pos:</span>
+                        <input type="range" id="db-custom-x" min="0" max="768" value="0" style="width: 120px; accent-color: #a78bfa;">
+                        <span id="db-val-x" style="color: #a78bfa; font-weight: bold; width: 30px; text-align: right;">0</span>
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 10px;">
+                        <span style="color: #94a3b8;">Y Pos:</span>
+                        <input type="range" id="db-custom-y" min="0" max="448" value="0" style="width: 120px; accent-color: #a78bfa;">
+                        <span id="db-val-y" style="color: #a78bfa; font-weight: bold; width: 30px; text-align: right;">0</span>
+                    </div>
+                    <button id="db-custom-apply" style="width: 100%; padding: 6px; background: #8b5cf6; border: none; color: white; font-weight: bold; border-radius: 6px; cursor: pointer; font-size: 11px; transition: background 0.2s;">Apply & Render Preview</button>
                 </div>
 
                 <div id="db-delay-wrapper" style="margin-bottom: 10px; font-size: 11px; display: flex; align-items: center; justify-content: space-between;">
@@ -2299,6 +2609,18 @@
             if (document.getElementById('db-fill-bg')) document.getElementById('db-fill-bg').checked = savedSetting.fillBg;
             if (document.getElementById('db-use-bridge')) document.getElementById('db-use-bridge').checked = savedSetting.useBridge;
             if (document.getElementById('db-bridge-len')) document.getElementById('db-bridge-len').value = savedSetting.bridgeLen;
+            if (savedSetting.layoutMode) layoutMode = savedSetting.layoutMode;
+            if (savedSetting.customX !== undefined) customX = savedSetting.customX;
+            if (savedSetting.customY !== undefined) customY = savedSetting.customY;
+            if (savedSetting.customW !== undefined) customW = savedSetting.customW;
+            if (savedSetting.customH !== undefined) customH = savedSetting.customH;
+        }
+
+        if (document.getElementById('db-layout-mode')) {
+            document.getElementById('db-layout-mode').value = layoutMode;
+            if (layoutMode === 'custom') {
+                document.getElementById('db-custom-sliders').style.display = 'block';
+            }
         }
 
         // Make draggable
@@ -2335,8 +2657,36 @@
                 currentImageSrc = event.target.result;
                 console.log('[DrawBot] File loaded into memory, length:', currentImageSrc.length);
                 document.getElementById('db-url').value = file.name;
-                console.log('[DrawBot] Calling processAndPreviewImage...');
-                processAndPreviewImage(currentImageSrc);
+                
+                // Preload draftImg and update layout bounds
+                loadImage(currentImageSrc).then(img => {
+                    draftImg = img;
+                    const imgRatio = img.width / img.height;
+                    const canvasRatio = 768 / 448;
+                    if (imgRatio > canvasRatio) {
+                        customW = 400;
+                        customH = Math.round(400 / imgRatio);
+                    } else {
+                        customH = 250;
+                        customW = Math.round(250 * imgRatio);
+                    }
+                    customX = Math.round((768 - customW) / 2);
+                    customY = Math.round((448 - customH) / 2);
+                    clampCustomBounds();
+                    updateSliders();
+                    
+                    if (layoutMode === 'custom') {
+                        drawDraftPreview();
+                        isApplied = false;
+                    } else {
+                        processAndPreviewImage(currentImageSrc);
+                        isApplied = true;
+                    }
+                }).catch(err => {
+                    console.error('[DrawBot] Error preloading draft image:', err);
+                    processAndPreviewImage(currentImageSrc);
+                    isApplied = true;
+                });
                 updateStatus('File loaded. Click Start.', '#a78bfa');
             };
             reader.readAsDataURL(file);
@@ -2348,77 +2698,105 @@
             const val = e.target.value.trim();
             if (val && (val.startsWith('http') || val.startsWith('data:'))) {
                 currentImageSrc = val;
-                processAndPreviewImage(currentImageSrc);
+                loadImage(currentImageSrc).then(img => {
+                    draftImg = img;
+                    const imgRatio = img.width / img.height;
+                    const canvasRatio = 768 / 448;
+                    if (imgRatio > canvasRatio) {
+                        customW = 400;
+                        customH = Math.round(400 / imgRatio);
+                    } else {
+                        customH = 250;
+                        customW = Math.round(250 * imgRatio);
+                    }
+                    customX = Math.round((768 - customW) / 2);
+                    customY = Math.round((448 - customH) / 2);
+                    clampCustomBounds();
+                    updateSliders();
+                    
+                    if (layoutMode === 'custom') {
+                        drawDraftPreview();
+                        isApplied = false;
+                    } else {
+                        processAndPreviewImage(currentImageSrc);
+                        isApplied = true;
+                    }
+                }).catch(err => {
+                    console.error('[DrawBot] Error preloading draft image from URL:', err);
+                    processAndPreviewImage(currentImageSrc);
+                    isApplied = true;
+                });
                 updateStatus('Image loaded from URL.', '#a78bfa');
             }
         });
 
         // Preview updating triggers
-        document.getElementById('db-scale').addEventListener('change', () => {
+        const handleTriggerUpdate = () => {
             saveSettings();
-            processAndPreviewImage(currentImageSrc);
+            if (layoutMode === 'custom') {
+                drawDraftPreview();
+                isApplied = false;
+            } else {
+                processAndPreviewImage(currentImageSrc);
+                isApplied = true;
+            }
+        };
+
+        document.getElementById('db-scale').addEventListener('change', () => {
+            handleTriggerUpdate();
         });
         document.getElementById('db-colors-mode').addEventListener('change', () => {
-            saveSettings();
-            processAndPreviewImage(currentImageSrc);
+            handleTriggerUpdate();
         });
         document.getElementById('db-denoise-level').addEventListener('change', () => {
-            saveSettings();
-            processAndPreviewImage(currentImageSrc);
+            handleTriggerUpdate();
         });
         document.getElementById('db-fill-bg').addEventListener('change', () => {
-            saveSettings();
-            processAndPreviewImage(currentImageSrc);
+            handleTriggerUpdate();
         });
         document.getElementById('db-use-bridge').addEventListener('change', () => {
-            saveSettings();
-            processAndPreviewImage(currentImageSrc);
+            handleTriggerUpdate();
         });
-
-        const drawModeSelect = document.getElementById('db-draw-mode');
-        const batchWrapper = document.getElementById('db-batch-wrapper');
-        drawModeSelect.addEventListener('change', () => {
-            saveSettings();
-            processAndPreviewImage(currentImageSrc);
-        });
-
-        document.getElementById('db-batch-size').addEventListener('input', () => {
-            let val = parseInt(document.getElementById('db-batch-size').value, 10);
-            if (isNaN(val) || val < 1) val = 1;
-            saveSettings();
-            processAndPreviewImage(currentImageSrc);
-        });
-
-        const delayInput = document.getElementById('db-delay');
-        delayInput.addEventListener('input', () => {
-            let delay = parseInt(delayInput.value, 10);
-            if (isNaN(delay) || delay < 0) delay = 0;
-            CFG.packetDelay = delay;
-            saveSettings();
-            processAndPreviewImage(currentImageSrc);
-        });
-
-        const fillPPSInput = document.getElementById('db-fill-pps');
-        fillPPSInput.addEventListener('input', () => {
-            let val = parseInt(fillPPSInput.value, 10);
-            if (isNaN(val) || val < 1) val = 1;
-            if (val > 30) val = 30;
-            CFG.fillPPS = val;
-            saveSettings();
-            processAndPreviewImage(currentImageSrc);
-        });
-
-        const bridgeLenInput = document.getElementById('db-bridge-len');
-        if (bridgeLenInput) {
-            bridgeLenInput.addEventListener('input', () => {
-                let val = parseInt(bridgeLenInput.value, 10);
-                if (isNaN(val) || val < 1) val = 1;
-                if (val > 150) val = 150;
-                CFG.maxBridgeLength = val;
-                saveSettings();
-                processAndPreviewImage(currentImageSrc);
-            });
-        }
+ 
+         const drawModeSelect = document.getElementById('db-draw-mode');
+         const batchWrapper = document.getElementById('db-batch-wrapper');
+         drawModeSelect.addEventListener('change', () => {
+             handleTriggerUpdate();
+         });
+ 
+         document.getElementById('db-batch-size').addEventListener('input', () => {
+             let val = parseInt(document.getElementById('db-batch-size').value, 10);
+             if (isNaN(val) || val < 1) val = 1;
+             handleTriggerUpdate();
+         });
+ 
+         const delayInput = document.getElementById('db-delay');
+         delayInput.addEventListener('input', () => {
+             let delay = parseInt(delayInput.value, 10);
+             if (isNaN(delay) || delay < 0) delay = 0;
+             CFG.packetDelay = delay;
+             handleTriggerUpdate();
+         });
+ 
+         const fillPPSInput = document.getElementById('db-fill-pps');
+         fillPPSInput.addEventListener('input', () => {
+             let val = parseInt(fillPPSInput.value, 10);
+             if (isNaN(val) || val < 1) val = 1;
+             if (val > 30) val = 30;
+             CFG.fillPPS = val;
+             handleTriggerUpdate();
+         });
+ 
+         const bridgeLenInput = document.getElementById('db-bridge-len');
+         if (bridgeLenInput) {
+             bridgeLenInput.addEventListener('input', () => {
+                 let val = parseInt(bridgeLenInput.value, 10);
+                 if (isNaN(val) || val < 1) val = 1;
+                 if (val > 150) val = 150;
+                 CFG.maxBridgeLength = val;
+                 handleTriggerUpdate();
+             });
+         }
 
         // Show/hide PPS and Delay depending on drawing mode
         const fillPPSWrapper = document.getElementById('db-fill-pps-wrapper');
@@ -2449,6 +2827,65 @@
             document.getElementById('db-use-bridge').addEventListener('change', updateFillPPSVisibility);
         }
         updateFillPPSVisibility();
+
+        // Layout change handler
+        const layoutSelect = document.getElementById('db-layout-mode');
+        const customSliders = document.getElementById('db-custom-sliders');
+        
+        if (layoutSelect) {
+            layoutSelect.addEventListener('change', () => {
+                layoutMode = layoutSelect.value;
+                saveSettings();
+                if (layoutMode === 'custom') {
+                    if (customSliders) customSliders.style.display = 'block';
+                    updateSliders();
+                    drawDraftPreview();
+                    isApplied = false;
+                } else {
+                    if (customSliders) customSliders.style.display = 'none';
+                    processAndPreviewImage(currentImageSrc);
+                    isApplied = true;
+                }
+            });
+        }
+
+        // Sliders input handlers
+        const wSlider = document.getElementById('db-custom-w');
+        const hSlider = document.getElementById('db-custom-h');
+        const xSlider = document.getElementById('db-custom-x');
+        const ySlider = document.getElementById('db-custom-y');
+        
+        const onSliderInput = () => {
+            if (wSlider) customW = parseInt(wSlider.value, 10);
+            if (hSlider) customH = parseInt(hSlider.value, 10);
+            if (xSlider) customX = parseInt(xSlider.value, 10);
+            if (ySlider) customY = parseInt(ySlider.value, 10);
+            
+            clampCustomBounds();
+            updateSliders();
+            drawDraftPreview();
+            isApplied = false;
+        };
+        
+        if (wSlider) wSlider.addEventListener('input', onSliderInput);
+        if (hSlider) hSlider.addEventListener('input', onSliderInput);
+        if (xSlider) xSlider.addEventListener('input', onSliderInput);
+        if (ySlider) ySlider.addEventListener('input', onSliderInput);
+        
+        const customApplyBtn = document.getElementById('db-custom-apply');
+        if (customApplyBtn) {
+            customApplyBtn.addEventListener('click', () => {
+                processAndPreviewImage(currentImageSrc);
+                isApplied = true;
+            });
+        }
+
+        // Canvas dragging listener
+        const pCanvas = document.getElementById('db-preview-canvas');
+        if (pCanvas) {
+            pCanvas.addEventListener('mousedown', handleCanvasMouseDown);
+            pCanvas.addEventListener('mousemove', handleCanvasMouseMoveNoDrag);
+        }
 
         // Drawing control triggers
         document.getElementById('db-start').addEventListener('click', () => {
