@@ -57,8 +57,8 @@
 To allow UserScripts to run in modern browsers:
 1. Open your browser's extensions page (e.g., `chrome://extensions` in Chrome, `edge://extensions` in Edge).
 2. Toggle the **Developer Mode** switch in the top-right corner to **ON**.
-3. Click on the **Details** (Details / Подробнее) button of the **Tampermonkey** extension.
-4. Locate the **Allow User Scripts** (Разрешить пользовательские скрипты) toggle and switch it to **ON**.
+3. Click on the **Details** button of the **Tampermonkey** extension.
+4. Locate the **Allow User Scripts** toggle and switch it to **ON**.
 5. *If prompted*, grant any necessary permissions.
 
 ### Step 3 — Install the Script
