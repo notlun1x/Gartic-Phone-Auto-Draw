@@ -2400,6 +2400,7 @@
                 box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5), 0 10px 10px -5px rgba(0,0,0,0.4);
                 transition: box-shadow 0.3s, border-color 0.3s;
                 user-select: none;
+                cursor: move;
             }
             #db-panel:hover {
                 border-color: rgba(255, 255, 255, 0.18);
@@ -2624,7 +2625,7 @@
         }
 
         // Make draggable
-        makeDraggable(panel, document.getElementById('db-header'));
+        makeDraggable(panel, panel);
 
         // Event Listeners
         const minimizeBtn = document.getElementById('db-minimize-btn');
@@ -2933,7 +2934,7 @@
 
         function dragMouseDown(e) {
             e = e || window.event;
-            if (['BUTTON', 'INPUT', 'SELECT', 'OPTION'].includes(e.target.tagName)) return;
+            if (e.target.closest('button, input, select, canvas, label, a')) return;
             e.preventDefault();
             pos3 = e.clientX;
             pos4 = e.clientY;
