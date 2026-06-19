@@ -57,7 +57,7 @@
 To allow UserScripts to run in modern browsers:
 1. Open your browser's extensions page (e.g., `chrome://extensions` in Chrome, `edge://extensions` in Edge).
 2. Toggle the **Developer Mode** switch in the top-right corner to **ON**.
-3. Click on the **Details** (Details / Подробнее) button of your UserScript manager extension (e.g., Tampermonkey).
+3. Click on the **Details** (Details / Подробнее) button of the **Tampermonkey** extension.
 4. Locate the **Allow User Scripts** (Разрешить пользовательские скрипты) toggle and switch it to **ON**.
 5. *If prompted*, grant any necessary permissions.
 
@@ -244,7 +244,7 @@ Each drawing packet follows this format:
 Для того чтобы пользовательские скрипты могли запускаться в современных браузерах:
 1. Перейдите на страницу расширений браузера (например, `chrome://extensions` в Chrome или `edge://extensions` в Edge).
 2. В правом верхнем углу переведите переключатель **Режим разработчика** в положение **ВКЛ** (ON).
-3. Нажмите кнопку **Сведения** (Details / Подробнее) вашего менеджера скриптов (например, Tampermonkey).
+3. Нажмите кнопку **Сведения** (Details / Подробнее) у расширения **Tampermonkey**.
 4. Найдите переключатель **Разрешить пользовательские скрипты** (Allow User Scripts) и переведите его в положение **ВКЛ**.
 5. Подтвердите дополнительные разрешения, если расширение этого потребует.
 
