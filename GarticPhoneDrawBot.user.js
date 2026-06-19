@@ -50,7 +50,7 @@
             denoise: false,
             packetDelay: 127,
             fillPPS: 8,
-            fillBg: true,
+            fillBg: false,
             useBridge: true,
             maxBridgeLength: 50,
             colorsMode: '8',
@@ -63,7 +63,7 @@
                 defaults.downscale = parseInt(saved.scale, 10) || 4;
                 defaults.packetDelay = parseInt(saved.delay, 10) || 127;
                 defaults.fillPPS = parseInt(saved.fillPPS, 10) || 8;
-                defaults.fillBg = saved.fillBg !== undefined ? saved.fillBg : true;
+                defaults.fillBg = saved.fillBg !== undefined ? saved.fillBg : false;
                 defaults.useBridge = saved.useBridge !== undefined ? saved.useBridge : true;
                 defaults.maxBridgeLength = parseInt(saved.bridgeLen, 10) || 50;
                 defaults.colorsMode = saved.colorsMode || '8';
@@ -2347,7 +2347,7 @@
                 delay: document.getElementById('db-delay')?.value || '127',
                 fillPPS: document.getElementById('db-fill-pps')?.value || '8',
                 denoise: document.getElementById('db-denoise-level')?.value || '0',
-                fillBg: document.getElementById('db-fill-bg')?.checked ?? true,
+                fillBg: document.getElementById('db-fill-bg')?.checked ?? false,
                 useBridge: document.getElementById('db-use-bridge')?.checked ?? true,
                 bridgeLen: document.getElementById('db-bridge-len')?.value || '50',
                 layoutMode: layoutMode,
@@ -2558,7 +2558,7 @@
                     </div>
                     <div style="flex: 1; font-size: 11px; display: flex; flex-direction: column; justify-content: flex-end; gap: 6px; padding-bottom: 2px;">
                         <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #94a3b8;">
-                            <input type="checkbox" id="db-fill-bg" checked style="accent-color: #a78bfa;"> Fill background
+                            <input type="checkbox" id="db-fill-bg" style="accent-color: #a78bfa;"> Fill background
                         </label>
                         <label id="db-bridge-wrapper" style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #94a3b8;">
                             <input type="checkbox" id="db-use-bridge" checked style="accent-color: #a78bfa;"> Smart Bridges
