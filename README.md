@@ -52,12 +52,14 @@
 1. Go to [tampermonkey.net](https://www.tampermonkey.net/)
 2. Click **Download** for your browser and install the extension.
 
-### Step 2 — Enable Developer Mode (Crucial for Manifest V3 / Chrome)
+### Step 2 — Enable Developer Mode & Allow User Scripts (Crucial for Manifest V3)
 
 To allow UserScripts to run in modern browsers:
 1. Open your browser's extensions page (e.g., `chrome://extensions` in Chrome, `edge://extensions` in Edge).
 2. Toggle the **Developer Mode** switch in the top-right corner to **ON**.
-3. *If prompted by Tampermonkey*, make sure to grant it the necessary permissions.
+3. Click on the **Details** (Details / Подробнее) button of your UserScript manager extension (e.g., Tampermonkey).
+4. Locate the **Allow User Scripts** (Разрешить пользовательские скрипты) toggle and switch it to **ON**.
+5. *If prompted*, grant any necessary permissions.
 
 ### Step 3 — Install the Script
 
@@ -237,12 +239,14 @@ Each drawing packet follows this format:
 1. Перейдите на [tampermonkey.net](https://www.tampermonkey.net/)
 2. Нажмите **Download** для вашего браузера и установите расширение.
 
-### Шаг 2 — Включите Режим разработчика (Важно для Chrome / Edge)
+### Шаг 2 — Включите Режим разработчика и Разрешите скрипты (Важно для Manifest V3)
 
 Для того чтобы пользовательские скрипты могли запускаться в современных браузерах:
 1. Перейдите на страницу расширений браузера (например, `chrome://extensions` в Chrome или `edge://extensions` в Edge).
 2. В правом верхнем углу переведите переключатель **Режим разработчика** в положение **ВКЛ** (ON).
-3. *Если Tampermonkey запросит дополнительные разрешения*, подтвердите их.
+3. Нажмите кнопку **Сведения** (Details / Подробнее) вашего менеджера скриптов (например, Tampermonkey).
+4. Найдите переключатель **Разрешить пользовательские скрипты** (Allow User Scripts) и переведите его в положение **ВКЛ**.
+5. Подтвердите дополнительные разрешения, если расширение этого потребует.
 
 ### Шаг 3 — Установите скрипт
 
