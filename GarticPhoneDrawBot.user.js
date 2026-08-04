@@ -81,7 +81,8 @@
     let cancelFlag = false;
     let isPaused = false;
     let currentImageSrc = '';
-    let strokeIdCounter = 1;
+    let strokeIdCounter = 100000 + Math.floor(Math.random() * 100000);
+    const SAFE_ID_FLOOR = 100000;
 
     // --- Layout and Custom Scale State ---
     let layoutMode = 'stretch'; // 'stretch', 'center', 'custom'
@@ -175,10 +176,9 @@
                 if (eventMatch) {
                     const eventId = parseInt(eventMatch[1], 10);
                     if (eventId !== 7) {
-                        if (strokeIdCounter !== 1) {
-                            console.log('[DrawBot] State event detected (event ' + eventId + '). Resetting strokeIdCounter to 1.');
-                            strokeIdCounter = 1;
-                        }
+                        const newSafeStart = 100000 + Math.floor(Math.random() * 100000);
+                        console.log('[DrawBot] State event detected (event ' + eventId + '). Resetting strokeIdCounter to ' + newSafeStart + '.');
+                        strokeIdCounter = newSafeStart;
                     }
                 }
             } catch (e) { }
@@ -214,7 +214,7 @@
                         if (packet.v && Array.isArray(packet.v)) {
                             const strokeId = packet.v[1];
                             if (typeof strokeId === 'number') {
-                                strokeIdCounter = strokeId + 1; // Direct sync instead of Math.max to allow resetting downwards
+                                strokeIdCounter = Math.max(strokeId + 1, SAFE_ID_FLOOR);
                                 console.log('[DrawBot] Captured strokeId. Next:', strokeIdCounter);
                             }
                         }
