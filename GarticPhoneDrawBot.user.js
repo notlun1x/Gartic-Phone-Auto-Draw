@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gartic Phone DrawBot
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Automated drawing bot with WebSocket interception, image loading, color quantization, preview and progress indicator
 // @author       NotLun1x
 // @match        https://garticphone.com/*
@@ -122,6 +122,19 @@
         { r: 254, g: 175, b: 168 }    // Light Pink
     ];
 
+    // --- Turn (round) ID ---
+    // Sent as "t" in every drawing packet. Auto-captured from socket traffic
+    // unless "Auto" is switched off in the panel and the value is set by hand.
+    let turnIdAuto = true;
+    function setCapturedTurnId(value, source) {
+        if (!turnIdAuto) return;
+        CFG.currentTurnId = value;
+        console.log(`[DrawBot] Captured turnId (${source}):`, value);
+        const input = document.getElementById('db-turn-id');
+        // Do not overwrite the field while the user is typing in it
+        if (input && document.activeElement !== input) input.value = value;
+    }
+
     // --- WebSocket Interceptor ---
     function handleIncomingSocketData(data) {
         if (typeof data !== 'string') return;
@@ -132,42 +145,41 @@
                 const packet = JSON.parse(jsonStr);
                 if (packet) {
                     if (typeof packet.turnNum === 'number') {
-                        CFG.currentTurnId = packet.turnNum;
-                        console.log('[DrawBot] Captured turnNum (incoming):', CFG.currentTurnId);
+                        setCapturedTurnId(packet.turnNum, 'incoming');
                     }
                     if (packet.data && typeof packet.data.turnNum === 'number') {
-                        CFG.currentTurnId = packet.data.turnNum;
-                        console.log('[DrawBot] Captured turnNum (incoming data):', CFG.currentTurnId);
+                        setCapturedTurnId(packet.data.turnNum, 'incoming data');
                     }
                 }
             }
         } catch (e) { }
     }
 
+    // Sockets that already have the incoming-message listener attached
+    const hookedSockets = new WeakSet();
+    function hookIncomingMessages(ws) {
+        if (!ws || hookedSockets.has(ws)) return;
+        hookedSockets.add(ws);
+        try {
+            // addEventListener does not interfere with the game's own onmessage handler
+            ws.addEventListener('message', function (event) {
+                handleIncomingSocketData(event.data);
+            });
+        } catch (err) {
+            console.error('[DrawBot] Error listening to incoming messages:', err);
+        }
+    }
+
     const originalSend = WebSocket.prototype.send;
     WebSocket.prototype.send = function (data) {
         if (typeof data === 'string' && data.startsWith('42[')) {
-            if (wsInstance !== this) {
+            // Fallback: socket created before the constructor wrapper was installed
+            hookIncomingMessages(this);
+            if (wsInstance !== this || !this.__drawbotLinked) {
+                this.__drawbotLinked = true;
                 wsInstance = this;
                 console.log('[DrawBot] WebSocket linked successfully!');
                 updateStatus('Socket ready. Select a file and click Start.', '#10b981');
-
-                // Intercept incoming messages for turnNum auto-detection
-                const self = this;
-                try {
-                    const originalOnMessage = self.onmessage;
-                    self.onmessage = function (event) {
-                        handleIncomingSocketData(event.data);
-                        if (originalOnMessage) {
-                            return originalOnMessage.apply(this, arguments);
-                        }
-                    };
-                    self.addEventListener('message', function (event) {
-                        handleIncomingSocketData(event.data);
-                    });
-                } catch (err) {
-                    console.error('[DrawBot] Error listening to incoming messages:', err);
-                }
             }
 
             // Reset stroke counter on state transitions (non-drawing events)
@@ -208,13 +220,15 @@
                     const packet = JSON.parse(jsonStr);
                     if (packet) {
                         if (typeof packet.t === 'number') {
-                            CFG.currentTurnId = packet.t;
-                            console.log('[DrawBot] Captured turnId (outgoing):', CFG.currentTurnId);
+                            setCapturedTurnId(packet.t, 'outgoing');
                         }
                         if (packet.v && Array.isArray(packet.v)) {
                             const strokeId = packet.v[1];
                             if (typeof strokeId === 'number') {
-                                strokeIdCounter = Math.max(strokeId + 1, SAFE_ID_FLOOR);
+                                // Never move the counter backwards within a turn: the game's own IDs are small,
+                                // so lowering it would make the next bot run reuse IDs it already sent.
+                                // A new turn is handled by the state-event reset above.
+                                strokeIdCounter = Math.max(strokeIdCounter, strokeId + 1, SAFE_ID_FLOOR);
                                 console.log('[DrawBot] Captured strokeId. Next:', strokeIdCounter);
                             }
                         }
@@ -231,6 +245,7 @@
     window.WebSocket = function (...args) {
         const ws = new originalWebSocket(...args);
         wsInstance = ws;
+        hookIncomingMessages(ws);
         return ws;
     };
     window.WebSocket.prototype = originalWebSocket.prototype;
@@ -2424,7 +2439,7 @@
             <div id="db-header" style="cursor: move; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 8px; margin-bottom: 12px;">
                 <div style="font-weight: 800; color: #a78bfa; font-size: 14px; display: flex; align-items: center; gap: 6px;">
                     <span class="pulse-dot"></span>
-                    DrawBot 1.1
+                    DrawBot 1.2
                 </div>
                 <button id="db-minimize-btn" style="background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 12px; transition: color 0.2s;">➖</button>
             </div>
@@ -2505,6 +2520,13 @@
                         </select>
                     </div>
                     <div style="flex: 1; font-size: 11px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                            <label for="db-turn-id" style="color: #94a3b8;">Round:</label>
+                            <label title="Detect the round from game traffic. Editing the number switches to manual." style="display: flex; align-items: center; gap: 4px; cursor: pointer; color: #94a3b8; font-size: 10px;">
+                                <input type="checkbox" id="db-turn-auto" checked style="accent-color: #a78bfa; margin: 0;"> Auto
+                            </label>
+                        </div>
+                        <input type="number" id="db-turn-id" min="0" step="1" value="0" title="Round (turn) number sent with every drawing packet" style="width: 100%; box-sizing: border-box; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
                     </div>
                 </div>
 
@@ -2828,6 +2850,27 @@
             document.getElementById('db-use-bridge').addEventListener('change', updateFillPPSVisibility);
         }
         updateFillPPSVisibility();
+
+        // Round (turn ID): auto-detected, can be overridden by hand
+        const turnInput = document.getElementById('db-turn-id');
+        const turnAutoCheckbox = document.getElementById('db-turn-auto');
+        if (turnInput && turnAutoCheckbox) {
+            turnInput.value = CFG.currentTurnId;
+            turnAutoCheckbox.checked = turnIdAuto;
+            turnInput.addEventListener('input', () => {
+                const val = parseInt(turnInput.value, 10);
+                if (isNaN(val) || val < 0) return;
+                // A hand-typed value must not be overwritten by the next captured packet
+                turnIdAuto = false;
+                turnAutoCheckbox.checked = false;
+                CFG.currentTurnId = val;
+                console.log('[DrawBot] Round set manually:', val);
+            });
+            turnAutoCheckbox.addEventListener('change', () => {
+                turnIdAuto = turnAutoCheckbox.checked;
+                console.log('[DrawBot] Round auto-detection:', turnIdAuto ? 'on' : 'off');
+            });
+        }
 
         // Layout change handler
         const layoutSelect = document.getElementById('db-layout-mode');
