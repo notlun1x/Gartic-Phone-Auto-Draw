@@ -132,7 +132,15 @@
         console.log(`[DrawBot] Captured turnId (${source}):`, value);
         const input = document.getElementById('db-turn-id');
         // Do not overwrite the field while the user is typing in it
-        if (input && document.activeElement !== input) input.value = value;
+        if (input && document.activeElement !== input) input.value = turnIdToRound(value);
+    }
+
+    // turnId is 0-based in packets, while the game counts rounds from 1
+    function turnIdToRound(turnId) {
+        return turnId + 1;
+    }
+    function roundToTurnId(round) {
+        return round - 1;
     }
 
     // --- WebSocket Interceptor ---
@@ -2526,7 +2534,7 @@
                                 <input type="checkbox" id="db-turn-auto" checked style="accent-color: #a78bfa; margin: 0;"> Auto
                             </label>
                         </div>
-                        <input type="number" id="db-turn-id" min="0" step="1" value="0" title="Round (turn) number sent with every drawing packet" style="width: 100%; box-sizing: border-box; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
+                        <input type="number" id="db-turn-id" min="1" step="1" value="1" title="Current round, counted from 1 as in the game" style="width: 100%; box-sizing: border-box; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
                     </div>
                 </div>
 
@@ -2855,16 +2863,16 @@
         const turnInput = document.getElementById('db-turn-id');
         const turnAutoCheckbox = document.getElementById('db-turn-auto');
         if (turnInput && turnAutoCheckbox) {
-            turnInput.value = CFG.currentTurnId;
+            turnInput.value = turnIdToRound(CFG.currentTurnId);
             turnAutoCheckbox.checked = turnIdAuto;
             turnInput.addEventListener('input', () => {
-                const val = parseInt(turnInput.value, 10);
-                if (isNaN(val) || val < 0) return;
+                const round = parseInt(turnInput.value, 10);
+                if (isNaN(round) || round < 1) return;
                 // A hand-typed value must not be overwritten by the next captured packet
                 turnIdAuto = false;
                 turnAutoCheckbox.checked = false;
-                CFG.currentTurnId = val;
-                console.log('[DrawBot] Round set manually:', val);
+                CFG.currentTurnId = roundToTurnId(round);
+                console.log('[DrawBot] Round set manually:', round, '(turnId', CFG.currentTurnId + ')');
             });
             turnAutoCheckbox.addEventListener('change', () => {
                 turnIdAuto = turnAutoCheckbox.checked;
