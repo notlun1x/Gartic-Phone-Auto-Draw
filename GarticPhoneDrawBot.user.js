@@ -11,35 +11,59 @@
 
 (function () {
     'use strict';
+    // Verbose per-packet logging; switch on when debugging protocol issues
+    const DEBUG = false;
+    function debugLog(...args) {
+        if (DEBUG) console.log(...args);
+    }
+
     // --- Event & Error Logging Helpers ---
+    const LOG_MAX_LINES = 50;
+    function formatLogArg(arg) {
+        if (arg instanceof Error) return arg.message;
+        if (typeof arg === 'object' && arg !== null) {
+            try { return JSON.stringify(arg); } catch (e) { return String(arg); }
+        }
+        return String(arg);
+    }
     function logToPanel(msg, isError = false) {
         try {
-            if (typeof document !== 'undefined') {
-                const container = document.getElementById('db-log-container');
-                const content = document.getElementById('db-log-content');
-                if (container && content) {
-                    container.style.display = 'block';
-                    const color = isError ? '#ef4444' : '#cbd5e1';
-                    content.innerHTML += `<div style="color: ${color};">${msg}</div>`;
-                    container.scrollTop = container.scrollHeight;
-                }
-            }
+            const container = document.getElementById('db-log-container');
+            const content = document.getElementById('db-log-content');
+            if (!container || !content) return;
+            container.style.display = 'block';
+            const line = document.createElement('div');
+            line.style.color = isError ? '#ef4444' : '#cbd5e1';
+            // textContent: messages may contain markup from URLs or game data
+            line.textContent = msg;
+            content.appendChild(line);
+            while (content.childElementCount > LOG_MAX_LINES) content.firstElementChild.remove();
+            container.scrollTop = container.scrollHeight;
         } catch (e) {
             console.warn('[DrawBot] Log output error:', e);
         }
     }
+    // The panel shows only this script's errors, not the game's own ones.
+    // Userscript managers put the script name into its URL, so it shows up in filename/stack.
+    function isOwnError(filename, stack) {
+        return /drawbot/i.test(String(filename || '')) || /drawbot/i.test(String(stack || ''));
+    }
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
         window.addEventListener('error', (e) => {
-            logToPanel(`Error: ${e.message} (${e.filename}:${e.lineno})`, true);
+            if (!isOwnError(e.filename, e.error && e.error.stack)) return;
+            logToPanel(`Error: ${e.message} (line ${e.lineno})`, true);
         });
         window.addEventListener('unhandledrejection', (e) => {
-            logToPanel(`Promise Rejection: ${e.reason}`, true);
+            if (!isOwnError('', e.reason && e.reason.stack)) return;
+            logToPanel(`Promise Rejection: ${formatLogArg(e.reason)}`, true);
         });
 
         const originalConsoleError = console.error;
         console.error = function (...args) {
             originalConsoleError.apply(console, args);
-            logToPanel('[Console.error] ' + args.join(' '), true);
+            if (typeof args[0] === 'string' && args[0].startsWith('[DrawBot]')) {
+                logToPanel(args.map(formatLogArg).join(' '), true);
+            }
         };
     }
 
@@ -81,8 +105,12 @@
     let cancelFlag = false;
     let isPaused = false;
     let currentImageSrc = '';
-    let strokeIdCounter = 100000 + Math.floor(Math.random() * 100000);
+    // Bot stroke IDs live far above the game's own small IDs, so manual strokes never collide with them
     const SAFE_ID_FLOOR = 100000;
+    function randomSafeStrokeStart() {
+        return SAFE_ID_FLOOR + Math.floor(Math.random() * 100000);
+    }
+    let strokeIdCounter = randomSafeStrokeStart();
 
     // --- Layout and Custom Scale State ---
     let layoutMode = 'stretch'; // 'stretch', 'center', 'custom'
@@ -128,11 +156,20 @@
     let turnIdAuto = true;
     function setCapturedTurnId(value, source) {
         if (!turnIdAuto) return;
-        CFG.currentTurnId = value;
-        console.log(`[DrawBot] Captured turnId (${source}):`, value);
+        debugLog(`[DrawBot] Captured turnId (${source}):`, value);
+        applyTurnId(value);
         const input = document.getElementById('db-turn-id');
         // Do not overwrite the field while the user is typing in it
         if (input && document.activeElement !== input) input.value = turnIdToRound(value);
+    }
+
+    // Stroke IDs only have to be unique within a round, so a new round starts a fresh sequence.
+    // Other socket events (chat, timers, state updates) no longer reset it mid-round.
+    function applyTurnId(value) {
+        if (value === CFG.currentTurnId) return;
+        CFG.currentTurnId = value;
+        strokeIdCounter = randomSafeStrokeStart();
+        console.log(`[DrawBot] Round ${turnIdToRound(value)}: stroke IDs restart at ${strokeIdCounter}.`);
     }
 
     // turnId is 0-based in packets, while the game counts rounds from 1
@@ -190,24 +227,13 @@
                 updateStatus('Socket ready. Select a file and click Start.', '#10b981');
             }
 
-            // Reset stroke counter on state transitions (non-drawing events)
-            try {
-                const eventMatch = data.match(/^42\[\d+,(\d+)[,\]]/);
-                if (eventMatch) {
-                    const eventId = parseInt(eventMatch[1], 10);
-                    if (eventId !== 7) {
-                        const newSafeStart = 100000 + Math.floor(Math.random() * 100000);
-                        console.log('[DrawBot] State event detected (event ' + eventId + '). Resetting strokeIdCounter to ' + newSafeStart + '.');
-                        strokeIdCounter = newSafeStart;
-                    }
-                }
-            } catch (e) { }
-
             // Dynamically capture the socket message prefix
             const prefixMatch = data.match(/^(42\[\d+,\d+,)\{"t":/);
             if (prefixMatch) {
-                wsPrefix = prefixMatch[1];
-                console.log('[DrawBot] Captured socket prefix:', wsPrefix);
+                if (wsPrefix !== prefixMatch[1]) {
+                    wsPrefix = prefixMatch[1];
+                    console.log('[DrawBot] Captured socket prefix:', wsPrefix);
+                }
             } else {
                 const genericMatch = data.match(/^42\[(\d+),/);
                 if (genericMatch) {
@@ -235,9 +261,9 @@
                             if (typeof strokeId === 'number') {
                                 // Never move the counter backwards within a turn: the game's own IDs are small,
                                 // so lowering it would make the next bot run reuse IDs it already sent.
-                                // A new turn is handled by the state-event reset above.
+                                // A new turn is handled by applyTurnId().
                                 strokeIdCounter = Math.max(strokeIdCounter, strokeId + 1, SAFE_ID_FLOOR);
-                                console.log('[DrawBot] Captured strokeId. Next:', strokeIdCounter);
+                                debugLog('[DrawBot] Captured strokeId. Next:', strokeIdCounter);
                             }
                         }
                     }
@@ -638,43 +664,6 @@
         return Math.min(max, Math.max(min, n));
     }
 
-    function normalizeFillRects(rects, canvasWidth, canvasHeight) {
-        if (!Array.isArray(rects) || canvasWidth <= 0 || canvasHeight <= 0) return [];
-
-        const normalized = [];
-        for (const rect of rects) {
-            if (!rect) continue;
-
-            const x = Math.round(Number(rect.x));
-            const y = Math.round(Number(rect.y));
-            const w = Math.round(Number(rect.w));
-            const h = Math.round(Number(rect.h));
-            if (![x, y, w, h].every(Number.isFinite)) continue;
-            if (w < 1 || h < 1) continue;
-
-            let x1 = x;
-            let y1 = y;
-            let x2 = x + w;
-            let y2 = y + h;
-
-            if (x2 <= 0 || y2 <= 0 || x1 >= canvasWidth || y1 >= canvasHeight) continue;
-
-            x1 = clampInt(x1, 0, canvasWidth - 1);
-            y1 = clampInt(y1, 0, canvasHeight - 1);
-            x2 = clampInt(x2, 1, canvasWidth);
-            y2 = clampInt(y2, 1, canvasHeight);
-
-            const nw = x2 - x1;
-            const nh = y2 - y1;
-            if (nw < 1 || nh < 1) continue;
-
-            normalized.push({ x: x1, y: y1, w: nw, h: nh });
-        }
-
-        normalized.sort((a, b) => a.y - b.y || a.x - b.x || a.h - b.h || a.w - b.w);
-        return normalized;
-    }
-
     function buildFillBatchFrame(strokeId, hexColor, rects) {
         if (!Number.isInteger(strokeId) || strokeId < 0) return null;
         if (!HEX_COLOR_RE.test(hexColor)) return null;
@@ -713,53 +702,6 @@
 
         return { frame };
     }
-
-    function getCanvasSampleHash(canvas) {
-        try {
-            if (!canvas || !canvas.width || !canvas.height) return null;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) return null;
-
-            const { width, height } = canvas;
-            const data = ctx.getImageData(0, 0, width, height).data;
-            const cols = 12;
-            const rows = 8;
-
-            let hash = 2166136261;
-            for (let sy = 0; sy < rows; sy++) {
-                const y = Math.min(height - 1, Math.floor((sy + 0.5) * height / rows));
-                for (let sx = 0; sx < cols; sx++) {
-                    const x = Math.min(width - 1, Math.floor((sx + 0.5) * width / cols));
-                    const idx = (y * width + x) * 4;
-                    hash ^= data[idx];
-                    hash = Math.imul(hash, 16777619);
-                    hash ^= data[idx + 1];
-                    hash = Math.imul(hash, 16777619);
-                    hash ^= data[idx + 2];
-                    hash = Math.imul(hash, 16777619);
-                }
-            }
-            return hash >>> 0;
-        } catch (err) {
-            console.warn('[DrawBot] Could not read canvas for fast-fill check:', err);
-            return null;
-        }
-    }
-
-    async function checkCanvasChanged(canvas, baselineHash) {
-        if (baselineHash === null || baselineHash === undefined) return null;
-        await sleep(Math.max(100, CFG.packetDelay * 2 + 40));
-        const nextHash = getCanvasSampleHash(canvas);
-        if (nextHash === null || nextHash === undefined) return null;
-        return nextHash !== baselineHash;
-    }
-
-    function normalizeHexColorOrDefault(input, fallback = '#FF0013') {
-        const hex = String(input || '').trim().toUpperCase();
-        if (HEX_COLOR_RE.test(hex)) return hex;
-        return fallback;
-    }
-
 
     // --- Optimized Fill Geometry Engine (Numeric Keys + DFS + Area-Maximizing Rects) ---
 
@@ -1224,7 +1166,7 @@
         if (rects.length === 0) return { frames: [], nextStrokeId: startStrokeId };
 
         const t1 = performance.now();
-        console.log(`[DrawBot] Optimization: ${pixelCount} px → ${rects.length} rects in ${(t1 - t0).toFixed(1)}ms`);
+        debugLog(`[DrawBot] Optimization: ${pixelCount} px → ${rects.length} rects in ${(t1 - t0).toFixed(1)}ms`);
 
         // Map rects to canvas coordinates (preserve DFS order for parent chain)
         const canvasRects = [];
@@ -1264,7 +1206,7 @@
         }));
 
         const t2 = performance.now();
-        console.log(`[DrawBot] Batching: ${canvasRects.length} rects → ${chunks.length} packets in ${(t2 - t1).toFixed(1)}ms`);
+        debugLog(`[DrawBot] Batching: ${canvasRects.length} rects → ${chunks.length} packets in ${(t2 - t1).toFixed(1)}ms`);
 
         return {
             frames: frames,
@@ -1380,6 +1322,7 @@
     }
 
     // --- Packet Sending Functions ---
+    // Every send function resolves to true only if the frame actually left through the socket.
     async function safeSendWithRetry(frame) {
         if (!wsInstance || !frame || cancelFlag) return false;
         const attempts = 3;
@@ -1401,43 +1344,49 @@
         return false;
     }
 
+    function isSocketClosed() {
+        return !wsInstance || wsInstance.readyState === 2 || wsInstance.readyState === 3;
+    }
+
     async function sendRectPacket(strokeId, hexColor, thickness, x1, y1, x2, y2) {
-        if (!wsInstance || cancelFlag) return;
+        if (!wsInstance || cancelFlag) return false;
         const rectPacket = {
             t: CFG.currentTurnId,
             d: 1,
             v: [6, strokeId, [hexColor, thickness, 10], x1, y1, x2, y2]
         };
         const frame = `${wsPrefix}${JSON.stringify(rectPacket)}]`;
-        console.log('[DrawBot] Sent rectangle packet (Tool 6):', frame);
-        await safeSendWithRetry(frame);
+        debugLog('[DrawBot] Sent rectangle packet (Tool 6):', frame);
+        const sent = await safeSendWithRetry(frame);
         await sleep(CFG.packetDelay);
+        return sent;
     }
 
     async function sendFillPacket(strokeId, hexColor, width, height) {
-        if (!wsInstance || cancelFlag) return;
+        if (!wsInstance || cancelFlag) return false;
         const fillPacket = {
             t: CFG.currentTurnId,
             d: 1,
             v: [8, strokeId, [hexColor, 10], 0, 0, width, height, 0]
         };
         const frame = `${wsPrefix}${JSON.stringify(fillPacket)}]`;
-        console.log('[DrawBot] Sent background fill packet (Tool 8):', frame);
-        await safeSendWithRetry(frame);
+        debugLog('[DrawBot] Sent background fill packet (Tool 8):', frame);
+        const sent = await safeSendWithRetry(frame);
         await sleep(CFG.packetDelay);
+        return sent;
     }
 
     async function sendFillBatchPacket(frame, rectCount, delayMs) {
         if (!wsInstance || !frame || cancelFlag) return false;
         const delay = (typeof delayMs === 'number' && delayMs >= 0) ? delayMs : CFG.packetDelay;
-        console.log(`[DrawBot] Sent Tool 8 packet (rects: ${rectCount}, length: ${frame.length}, delay: ${delay}ms)`);
+        debugLog(`[DrawBot] Sent Tool 8 packet (rects: ${rectCount}, length: ${frame.length}, delay: ${delay}ms)`);
         const sent = await safeSendWithRetry(frame);
         await sleep(delay);
         return sent;
     }
 
     async function sendStrokePackets(strokeId, hexColor, points, thickness) {
-        if (!wsInstance || points.length === 0 || cancelFlag) return;
+        if (!wsInstance || points.length === 0 || cancelFlag) return false;
 
         const start = points[0];
         const startPacket = {
@@ -1446,9 +1395,10 @@
             v: [1, strokeId, [hexColor, thickness, 10], start.x, start.y]
         };
         const startFrame = `${wsPrefix}${JSON.stringify(startPacket)}]`;
-        console.log('[DrawBot] Sent line start packet (Tool 1):', startFrame);
-        await safeSendWithRetry(startFrame);
+        debugLog('[DrawBot] Sent line start packet (Tool 1):', startFrame);
+        const startSent = await safeSendWithRetry(startFrame);
         await sleep(CFG.packetDelay);
+        if (!startSent) return false;
 
         if (points.length > 1 && !cancelFlag) {
             const vArray = [1, strokeId, [hexColor, thickness, 10], start.x, start.y];
@@ -1462,13 +1412,17 @@
                 v: vArray
             };
             const moveFrame = `${wsPrefix}${JSON.stringify(movePacket)}]`;
-            console.log('[DrawBot] Sent line move packet (Tool 1):', moveFrame);
-            await safeSendWithRetry(moveFrame);
+            debugLog('[DrawBot] Sent line move packet (Tool 1):', moveFrame);
+            const moveSent = await safeSendWithRetry(moveFrame);
             await sleep(CFG.packetDelay);
+            return moveSent;
         }
+        return true;
     }
 
     // --- Image Preprocessing & Analysis ---
+    // Returns the image as a flat grid of color indices (-1 = transparent) plus the list of
+    // distinct hex colors those indices point to. Every color in the list occurs in the grid.
     function processImage(img, step, colorsMode, denoiseLevel) {
         const w = Math.round(768 / step);
         const h = Math.round(448 / step);
@@ -1478,7 +1432,7 @@
         tempCanvas.height = h;
         const ctx = tempCanvas.getContext('2d');
         ctx.clearRect(0, 0, w, h);
-        
+
         if (layoutMode === 'stretch') {
             ctx.drawImage(img, 0, 0, w, h);
         } else if (layoutMode === 'center') {
@@ -1541,7 +1495,8 @@
         const paletteHex = palette.map(c => rgbToHex(c.r, c.g, c.b));
         const whiteIdx = paletteHex.indexOf('#FFFFFF');
 
-        const pixelIndices = new Int16Array(w * h);
+        // Int32: "No limit" mode can have far more than 32767 palette entries
+        const pixelIndices = new Int32Array(w * h);
         for (let y = 0; y < h; y++) {
             const rowOffset = y * w;
             for (let x = 0; x < w; x++) {
@@ -1567,7 +1522,7 @@
         }
 
         if (denoiseLevel > 0) {
-            const tempIndices = new Int16Array(pixelIndices);
+            const tempIndices = new Int32Array(pixelIndices);
             const counts = new Map();
             for (let y = 0; y < h; y++) {
                 const rowOffset = y * w;
@@ -1626,173 +1581,236 @@
             pixelIndices.set(tempIndices);
         }
 
-        const mappedGrid = Array(w).fill(null).map(() => Array(h).fill(null));
-        for (let x = 0; x < w; x++) {
-            for (let y = 0; y < h; y++) {
-                const idx = pixelIndices[y * w + x];
-                mappedGrid[x][y] = (idx === -1) ? 'transparent' : paletteHex[idx];
+        // Re-index to distinct colors actually present: quantization can produce palette
+        // entries that round to the same hex, and many palette entries may stay unused
+        const colors = [];
+        const hexToColorIdx = new Map();
+        const paletteToColorIdx = new Int32Array(palette.length).fill(-1);
+        for (let i = 0; i < pixelIndices.length; i++) {
+            const p = pixelIndices[i];
+            if (p === -1) continue;
+            let c = paletteToColorIdx[p];
+            if (c === -1) {
+                const hex = paletteHex[p];
+                c = hexToColorIdx.get(hex);
+                if (c === undefined) {
+                    c = colors.length;
+                    colors.push(hex);
+                    hexToColorIdx.set(hex, c);
+                }
+                paletteToColorIdx[p] = c;
             }
+            pixelIndices[i] = c;
         }
 
-        return { grid: mappedGrid, width: w, height: h };
+        return { indices: pixelIndices, colors, width: w, height: h };
     }
 
-    function analyzeDrawingCommands(grid, width, height, fillBg, drawMode, batchSize, useBridge) {
-        const workingGrid = Array(width).fill(null).map((_, x) => Array(height).fill(null).map((_, y) => grid[x][y]));
+    // Preview and drawing need the same processed image; recomputing it is the slowest step
+    let processedCache = null;
+    function processImageCached(img, src, step, colorsMode, denoiseLevel) {
+        const key = [step, colorsMode, denoiseLevel, layoutMode, customX, customY, customW, customH].join('|');
+        if (processedCache && processedCache.src === src && processedCache.key === key) {
+            return processedCache.result;
+        }
+        const result = processImage(img, step, colorsMode, denoiseLevel);
+        processedCache = { src, key, result };
+        return result;
+    }
 
-        const colors = new Set();
-        for (let x = 0; x < width; x++) {
-            for (let y = 0; y < height; y++) {
-                colors.add(workingGrid[x][y]);
+    // Most common color: drawn as one background fill instead of many rectangles
+    function findBackgroundColorIdx(indices, colorCount) {
+        const counts = new Int32Array(colorCount);
+        for (let i = 0; i < indices.length; i++) {
+            if (indices[i] >= 0) counts[indices[i]]++;
+        }
+        let best = -1;
+        let bestCount = 0;
+        for (let c = 0; c < colorCount; c++) {
+            if (counts[c] > bestCount) {
+                bestCount = counts[c];
+                best = c;
             }
         }
+        return best;
+    }
 
-        let totalRects = 0;
-        let totalPaths = 0;
-        let totalPackets = 0;
-        let skippedColor = null;
+    function buildColorMask(indices, colorIdx) {
+        const mask = new Uint8Array(indices.length);
+        for (let i = 0; i < indices.length; i++) {
+            if (indices[i] === colorIdx) mask[i] = 1;
+        }
+        return mask;
+    }
 
-        if (fillBg && colors.size > 0) {
-            const counts = {};
-            for (let x = 0; x < width; x++) {
-                for (let y = 0; y < height; y++) {
-                    const c = workingGrid[x][y];
-                    counts[c] = (counts[c] || 0) + 1;
-                }
-            }
-            let maxCount = 0;
-            let mostPopularColor = null;
-            for (let c in counts) {
-                if (c === 'transparent') continue;
-                if (counts[c] > maxCount) {
-                    maxCount = counts[c];
-                    mostPopularColor = c;
-                }
-            }
-            if (mostPopularColor) {
-                skippedColor = mostPopularColor;
-            }
+    // Standard Lines mode: rectangles first, then the leftover pixels as straight lines or paths
+    function buildLineCommands(mask, width, height, step, scaleX, scaleY) {
+        const toCanvasRect = (x, y, w, h) => ({
+            kind: 'rect',
+            x1: Math.round(x * step * scaleX),
+            y1: Math.round(y * step * scaleY),
+            x2: Math.round((x + w) * step * scaleX),
+            y2: Math.round((y + h) * step * scaleY)
+        });
+
+        const commands = [];
+        const { rects, remainingGrid } = findMaxRectangles(mask, width, height, 2, 2);
+        for (const r of rects) {
+            commands.push(toCanvasRect(r.x, r.y, r.width, r.height));
         }
 
-        const colorsToDraw = Array.from(colors).filter(c => c !== skippedColor && c !== 'transparent');
-        let colorIndexGrid = null;
-        if (drawMode === 'fill') {
-            const islandCounts = new Map();
-            for (const color of colorsToDraw) {
-                const colorGrid = new Uint8Array(width * height);
-                for (let y = 0; y < height; y++) {
-                    const rowBase = y * width;
-                    for (let x = 0; x < width; x++) {
-                        if (workingGrid[x][y] === color) {
-                            colorGrid[rowBase + x] = 1;
-                        }
-                    }
-                }
-                islandCounts.set(color, countIslands(colorGrid, width, height));
-            }
-            colorsToDraw.sort((a, b) => islandCounts.get(b) - islandCounts.get(a));
-
-            const colorToIndex = new Map();
-            for (let i = 0; i < colorsToDraw.length; i++) {
-                colorToIndex.set(colorsToDraw[i], i);
-            }
-            colorIndexGrid = new Int32Array(width * height);
-            for (let y = 0; y < height; y++) {
-                const rowBase = y * width;
-                for (let x = 0; x < width; x++) {
-                    const color = workingGrid[x][y];
-                    const idx = colorToIndex.get(color);
-                    colorIndexGrid[rowBase + x] = (idx !== undefined) ? idx : -1;
-                }
+        const paths = findPaths(remainingGrid, width, height);
+        for (const path of paths) {
+            const first = path[0];
+            if (path.length === 1) {
+                commands.push(toCanvasRect(first.x, first.y, 1, 1));
+            } else if (path.every(p => p.y === first.y)) {
+                const xs = path.map(p => p.x);
+                const minX = Math.min(...xs);
+                commands.push(toCanvasRect(minX, first.y, Math.max(...xs) - minX + 1, 1));
+            } else if (path.every(p => p.x === first.x)) {
+                const ys = path.map(p => p.y);
+                const minY = Math.min(...ys);
+                commands.push(toCanvasRect(first.x, minY, 1, Math.max(...ys) - minY + 1));
+            } else {
+                const points = simplifyPath(path.map(p => ({
+                    x: Math.round((p.x * step + step / 2) * scaleX),
+                    y: Math.round((p.y * step + step / 2) * scaleY)
+                })));
+                commands.push({ kind: 'path', points });
             }
         }
+        return commands;
+    }
 
-        const canvas = getGameCanvas() || { width: 768, height: 448 };
-        const step = parseInt(document.getElementById('db-scale') ? document.getElementById('db-scale').value : '2', 10);
+    // Progress units of one line-mode command: a path is a start packet plus a move packet
+    function lineCommandWeight(cmd) {
+        return cmd.kind === 'path' && cmd.points.length > 1 ? 2 : 1;
+    }
+
+    // Everything the bot will send, computed once. The preview uses it for its numbers,
+    // the drawing loop sends it as is. In fill mode the frames already carry their stroke IDs.
+    function buildDrawPlan(processed, opts) {
+        const { indices, colors, width, height } = processed;
+        const { fillBg, drawMode, batchSize, useBridge, maxBridgeLength, step, canvas } = opts;
         const scaleX = canvas.width / 768;
         const scaleY = canvas.height / 448;
+        let strokeId = opts.startStrokeId;
 
-        for (let color of colors) {
-            if (color === skippedColor) continue;
-
-            const colorGrid = new Uint8Array(width * height);
-            for (let y = 0; y < height; y++) {
-                const rowBase = y * width;
-                for (let x = 0; x < width; x++) {
-                    if (workingGrid[x][y] === color) {
-                        colorGrid[rowBase + x] = 1;
-                    }
-                }
-            }
-
-            if (drawMode === 'fill') {
-                if (useBridge) {
-                    applyBridging(colorGrid, colorIndexGrid, width, height, color, colorsToDraw, CFG.maxBridgeLength);
-                }
-                const result = generateFillBatchesFromGrid(colorGrid, width, height, color, 1, step, scaleX, scaleY, canvas, batchSize);
-                totalRects += result.frames.reduce((acc, f) => acc + f.rectCount, 0);
-                totalPackets += result.frames.length;
-            } else {
-                const { rects, remainingGrid } = findMaxRectangles(colorGrid, width, height, 2, 2);
-                totalRects += rects.length;
-
-                const paths = findPaths(remainingGrid, width, height);
-                for (let path of paths) {
-                    if (path.length === 1) {
-                        totalRects++;
-                    } else {
-                        const first = path[0];
-                        const isHorizontal = path.every(p => p.y === first.y);
-                        const isVertical = path.every(p => p.x === first.x);
-                        if (isHorizontal || isVertical) {
-                            totalRects++;
-                        } else {
-                            totalPaths++;
-                        }
-                    }
-                }
-            }
+        const bgIdx = fillBg ? findBackgroundColorIdx(indices, colors.length) : -1;
+        let background = null;
+        if (bgIdx >= 0) {
+            // Sent twice, the first fill packet is sometimes dropped by the game
+            background = { hex: colors[bgIdx], strokeIds: [strokeId++, strokeId++] };
         }
 
-        let commandCount = 0;
+        const order = [];
+        for (let c = 0; c < colors.length; c++) {
+            if (c !== bgIdx) order.push(c);
+        }
+
+        const steps = [];
+        let rectCount = 0;
+        let pathCount = 0;
+        let packetCount = 0;
+        let totalCommands = background ? background.strokeIds.length : 0;
+
         if (drawMode === 'fill') {
-            commandCount = (skippedColor ? 2 : 0) + totalPackets;
+            // Colors with many islands go first so later colors can bridge across them
+            const islands = new Map();
+            for (const c of order) {
+                islands.set(c, countIslands(buildColorMask(indices, c), width, height));
+            }
+            order.sort((a, b) => islands.get(b) - islands.get(a));
+
+            const orderHex = order.map(c => colors[c]);
+            const colorToOrder = new Int32Array(colors.length).fill(-1);
+            order.forEach((c, i) => { colorToOrder[c] = i; });
+            const colorIndexGrid = new Int32Array(indices.length);
+            for (let i = 0; i < indices.length; i++) {
+                colorIndexGrid[i] = indices[i] >= 0 ? colorToOrder[indices[i]] : -1;
+            }
+
+            for (const c of order) {
+                const hex = colors[c];
+                const mask = buildColorMask(indices, c);
+                if (useBridge) {
+                    applyBridging(mask, colorIndexGrid, width, height, hex, orderHex, maxBridgeLength);
+                }
+                const result = generateFillBatchesFromGrid(mask, width, height, hex, strokeId, step, scaleX, scaleY, canvas, batchSize);
+                strokeId = result.nextStrokeId;
+                if (result.frames.length === 0) continue;
+                steps.push({ hex, frames: result.frames });
+                packetCount += result.frames.length;
+                rectCount += result.frames.reduce((acc, f) => acc + f.rectCount, 0);
+            }
+            totalCommands += packetCount;
         } else {
-            commandCount = (skippedColor ? 2 : 0) + totalRects + totalPaths * 1.8;
+            for (const c of order) {
+                const commands = buildLineCommands(buildColorMask(indices, c), width, height, step, scaleX, scaleY);
+                if (commands.length === 0) continue;
+                steps.push({ hex: colors[c], commands });
+                for (const cmd of commands) {
+                    if (cmd.kind === 'rect') rectCount++;
+                    else pathCount++;
+                    totalCommands += lineCommandWeight(cmd);
+                }
+            }
         }
 
+        // Lines mode assigns stroke IDs while sending, starting here
+        return { background, steps, rectCount, pathCount, packetCount, totalCommands, nextStrokeId: strokeId };
+    }
+
+    // --- Draw options from the panel ---
+    const BATCH_SIZE_DEFAULT = 3000;
+    const BATCH_SIZE_MAX = 9000;
+    const PREVIEW_DEBOUNCE_MS = 300;
+
+    function readDrawOptions() {
+        const el = id => document.getElementById(id);
+        const readInt = (id, fallback, min, max) => {
+            const v = parseInt(el(id) ? el(id).value : '', 10);
+            return isNaN(v) ? fallback : clampInt(v, min, max);
+        };
         return {
-            rects: totalRects,
-            paths: totalPaths,
-            packets: totalPackets,
-            fillPacketCount: drawMode === 'fill' ? totalPackets : 0,
-            skippedColor,
-            totalCommands: Math.round(commandCount)
+            step: readInt('db-scale', 4, 1, 15),
+            colorsMode: el('db-colors-mode') ? el('db-colors-mode').value : '8',
+            denoiseLevel: readInt('db-denoise-level', 0, 0, 3),
+            fillBg: el('db-fill-bg') ? el('db-fill-bg').checked : false,
+            drawMode: el('db-draw-mode') ? el('db-draw-mode').value : 'fill',
+            batchSize: readInt('db-batch-size', BATCH_SIZE_DEFAULT, 1, BATCH_SIZE_MAX),
+            useBridge: el('db-use-bridge') ? el('db-use-bridge').checked : false,
+            maxBridgeLength: readInt('db-bridge-len', 50, 1, 150),
+            packetDelay: readInt('db-delay', 127, 0, 1000),
+            fillPPS: readInt('db-fill-pps', 8, 1, 30)
         };
     }
 
+    function fillIntervalFor(pps) {
+        return Math.max(125, Math.ceil(1000 / pps)) + 2;
+    }
+
+    // Each call bumps the generation, so a slow older preview cannot overwrite a newer one
+    let previewGeneration = 0;
     async function processAndPreviewImage(src) {
         if (!src) return;
+        const generation = ++previewGeneration;
         const infoEl = document.getElementById('db-preview-info');
         infoEl.textContent = 'Processing...';
 
         try {
             const img = await loadImage(src);
+            if (generation !== previewGeneration) return;
             draftImg = img;
-            const step = parseInt(document.getElementById('db-scale').value, 10);
-            const colorsMode = document.getElementById('db-colors-mode').value;
-            const denoiseLevel = parseInt(document.getElementById('db-denoise-level').value, 10);
-            const fillBg = document.getElementById('db-fill-bg').checked;
-            const drawMode = document.getElementById('db-draw-mode').value;
-            const batchSize = parseInt(document.getElementById('db-batch-size').value, 10) || 3000;
-            const useBridge = document.getElementById('db-use-bridge') ? document.getElementById('db-use-bridge').checked : false;
-            const bridgeLenInput = document.getElementById('db-bridge-len');
-            if (bridgeLenInput) {
-                CFG.maxBridgeLength = parseInt(bridgeLenInput.value, 10) || 50;
-            }
+            const opts = readDrawOptions();
+            CFG.maxBridgeLength = opts.maxBridgeLength;
 
-            const processed = processImage(img, step, colorsMode, denoiseLevel);
-            const analysis = analyzeDrawingCommands(processed.grid, processed.width, processed.height, fillBg, drawMode, batchSize, useBridge);
+            const processed = processImageCached(img, src, opts.step, opts.colorsMode, opts.denoiseLevel);
+            const plan = buildDrawPlan(processed, Object.assign({}, opts, {
+                canvas: getGameCanvas() || { width: 768, height: 448 },
+                startStrokeId: 1
+            }));
 
             // Render Preview Canvas
             const pCanvas = document.getElementById('db-preview-canvas');
@@ -1801,41 +1819,33 @@
             const pCtx = pCanvas.getContext('2d');
             const pImgData = pCtx.createImageData(processed.width, processed.height);
             const pData = pImgData.data;
+            const rgbColors = processed.colors.map(hexToRgb);
 
-            for (let y = 0; y < processed.height; y++) {
-                for (let x = 0; x < processed.width; x++) {
-                    const hex = processed.grid[x][y];
-                    const idx = (y * processed.width + x) * 4;
-                    if (hex === 'transparent') {
-                        pData[idx] = 0;
-                        pData[idx + 1] = 0;
-                        pData[idx + 2] = 0;
-                        pData[idx + 3] = 0;
-                    } else {
-                        const rgb = hexToRgb(hex);
-                        pData[idx] = rgb.r;
-                        pData[idx + 1] = rgb.g;
-                        pData[idx + 2] = rgb.b;
-                        pData[idx + 3] = 255;
-                    }
-                }
+            for (let i = 0; i < processed.indices.length; i++) {
+                const c = processed.indices[i];
+                if (c === -1) continue; // createImageData starts fully transparent
+                const rgb = rgbColors[c];
+                const idx = i * 4;
+                pData[idx] = rgb.r;
+                pData[idx + 1] = rgb.g;
+                pData[idx + 2] = rgb.b;
+                pData[idx + 3] = 255;
             }
             pCtx.putImageData(pImgData, 0, 0);
             document.getElementById('db-preview-container').style.display = 'flex';
 
-            const delay = parseInt(document.getElementById('db-delay')?.value || '127', 10) || 127;
-            if (drawMode === 'fill') {
-                const fillPPS = parseInt(document.getElementById('db-fill-pps').value, 10) || 8;
-                const fillInterval = Math.max(125, Math.ceil(1000 / fillPPS)) + 2;
-                const estSec = Math.round((analysis.fillPacketCount * fillInterval) / 1000) + (analysis.skippedColor ? 1 : 0);
-                infoEl.innerHTML = `Rects: <b>${analysis.rects}</b> | Packets: <b>${analysis.fillPacketCount}</b><br>Speed: <b>${fillPPS} pkt/s</b> (${fillInterval}ms) | ~<b>${estSec}s</b>`;
+            if (opts.drawMode === 'fill') {
+                const fillInterval = fillIntervalFor(opts.fillPPS);
+                const estSec = Math.round((plan.packetCount * fillInterval) / 1000) + (plan.background ? 1 : 0);
+                infoEl.innerHTML = `Rects: <b>${plan.rectCount}</b> | Packets: <b>${plan.packetCount}</b><br>Speed: <b>${opts.fillPPS} pkt/s</b> (${fillInterval}ms) | ~<b>${estSec}s</b>`;
             } else {
-                const estSec = Math.round((analysis.totalCommands * delay) / 1000);
-                infoEl.innerHTML = `Rects: <b>${analysis.rects}</b> | Lines: <b>${analysis.paths}</b><br>Draw time: <b>~${estSec}s</b>`;
+                const estSec = Math.round((plan.totalCommands * opts.packetDelay) / 1000);
+                infoEl.innerHTML = `Rects: <b>${plan.rectCount}</b> | Lines: <b>${plan.pathCount}</b><br>Draw time: <b>~${estSec}s</b>`;
             }
             isApplied = true;
         } catch (e) {
-            console.error(e);
+            if (generation !== previewGeneration) return;
+            console.error('[DrawBot] Preview error:', e);
             infoEl.textContent = 'Loading/preview error';
             isApplied = false;
         }
@@ -1847,47 +1857,28 @@
         }
     }
 
+    function setDrawingControls(drawing) {
+        const startBtn = document.getElementById('db-start');
+        if (startBtn) startBtn.style.display = drawing ? 'none' : 'block';
+        const pauseBtn = document.getElementById('db-pause');
+        if (pauseBtn) {
+            pauseBtn.style.display = drawing ? 'block' : 'none';
+            pauseBtn.textContent = '⏸ Pause';
+            pauseBtn.style.background = '#d97706';
+        }
+        const cancelBtn = document.getElementById('db-cancel');
+        if (cancelBtn) cancelBtn.style.display = drawing ? 'block' : 'none';
+        const progressWrapper = document.getElementById('db-progress-wrapper');
+        if (progressWrapper) progressWrapper.style.display = drawing ? 'block' : 'none';
+    }
+
     function resetDrawUI() {
-        console.log('[DrawBot] resetDrawUI: Starting UI reset.');
         isDrawing = false;
         try {
-            const startBtn = document.getElementById('db-start');
-            if (startBtn) {
-                console.log('[DrawBot] resetDrawUI: Start button found. Previous display:', startBtn.style.display);
-                startBtn.style.display = 'block';
-            } else {
-                console.warn('[DrawBot] resetDrawUI: Start button not found in DOM!');
-            }
-
-            const pauseBtn = document.getElementById('db-pause');
-            if (pauseBtn) {
-                console.log('[DrawBot] resetDrawUI: Pause button found. Previous display:', pauseBtn.style.display);
-                pauseBtn.style.display = 'none';
-                pauseBtn.textContent = '⏸ Pause';
-                pauseBtn.style.background = '#d97706';
-            } else {
-                console.warn('[DrawBot] resetDrawUI: Pause button not found in DOM!');
-            }
-
-            const cancelBtn = document.getElementById('db-cancel');
-            if (cancelBtn) {
-                console.log('[DrawBot] resetDrawUI: Cancel button found. Previous display:', cancelBtn.style.display);
-                cancelBtn.style.display = 'none';
-            } else {
-                console.warn('[DrawBot] resetDrawUI: Cancel button not found in DOM!');
-            }
-
-            const progressWrapper = document.getElementById('db-progress-wrapper');
-            if (progressWrapper) {
-                console.log('[DrawBot] resetDrawUI: Progress bar found. Previous display:', progressWrapper.style.display);
-                progressWrapper.style.display = 'none';
-            } else {
-                console.warn('[DrawBot] resetDrawUI: Progress bar not found in DOM!');
-            }
+            setDrawingControls(false);
         } catch (e) {
             console.error('[DrawBot] Error during UI reset:', e);
         }
-        console.log('[DrawBot] resetDrawUI: UI reset completed.');
     }
 
     function updateStatus(msg, color = '#9ca3af') {
@@ -1896,6 +1887,37 @@
             el.textContent = msg;
             el.style.color = color;
         }
+    }
+
+    function setProgress(pct, timeText) {
+        const bar = document.getElementById('db-progress-bar');
+        if (bar) bar.style.width = `${pct}%`;
+        const percent = document.getElementById('db-progress-percent');
+        if (percent) percent.textContent = `${pct}%`;
+        const time = document.getElementById('db-progress-time');
+        if (time) time.textContent = timeText;
+    }
+
+    // Local echo of what was sent, so the user sees the drawing appear
+    function renderLocally(canvas, draw) {
+        try {
+            draw(canvas.getContext('2d'));
+        } catch (e) {
+            console.error('[DrawBot] Error rendering on canvas:', e);
+        }
+    }
+
+    function strokeLocally(ctx, hex, thickness, points) {
+        ctx.strokeStyle = hex;
+        ctx.lineWidth = thickness;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i++) {
+            ctx.lineTo(points[i].x, points[i].y);
+        }
+        ctx.stroke();
     }
 
     // --- Drawing Loop ---
@@ -1912,55 +1934,25 @@
             return;
         }
 
+        const drawTurnId = CFG.currentTurnId;
         let strokeId = strokeIdCounter;
 
         try {
-            const step = parseInt(document.getElementById('db-scale').value, 10);
-            const colorsMode = document.getElementById('db-colors-mode').value;
-            const denoiseLevel = parseInt(document.getElementById('db-denoise-level').value, 10);
-            const fillBg = document.getElementById('db-fill-bg').checked;
-            const drawMode = document.getElementById('db-draw-mode').value;
-            const batchSize = parseInt(document.getElementById('db-batch-size').value, 10) || 3000;
-            CFG.packetDelay = parseInt(document.getElementById('db-delay').value, 10);
-            CFG.fillPPS = parseInt(document.getElementById('db-fill-pps').value, 10) || 8;
-            CFG.useBridge = document.getElementById('db-use-bridge') ? document.getElementById('db-use-bridge').checked : false;
-            const bridgeLenInput = document.getElementById('db-bridge-len');
-            if (bridgeLenInput) {
-                CFG.maxBridgeLength = parseInt(bridgeLenInput.value, 10) || 50;
-            }
-            const fillInterval = Math.max(125, Math.ceil(1000 / CFG.fillPPS)) + 2;
-
-            const scaleX = canvas.width / 768;
-            const scaleY = canvas.height / 448;
-
-            let thickness = step * 4 - 2;
+            const opts = readDrawOptions();
+            CFG.packetDelay = opts.packetDelay;
+            CFG.fillPPS = opts.fillPPS;
+            CFG.useBridge = opts.useBridge;
+            CFG.maxBridgeLength = opts.maxBridgeLength;
+            const fillInterval = fillIntervalFor(opts.fillPPS);
+            const thickness = opts.step * 4 - 2;
 
             isDrawing = true;
             cancelFlag = false;
             isPaused = false;
             const drawStartTime = performance.now();
 
-            const startBtn = document.getElementById('db-start');
-            if (startBtn) startBtn.style.display = 'none';
-            const pauseBtn = document.getElementById('db-pause');
-            if (pauseBtn) {
-                pauseBtn.style.display = 'block';
-                pauseBtn.textContent = '⏸ Pause';
-                pauseBtn.style.background = '#d97706';
-            }
-            const cancelBtn = document.getElementById('db-cancel');
-            if (cancelBtn) cancelBtn.style.display = 'block';
-
-            // Reset progress details before drawing starts
-            const progressBar = document.getElementById('db-progress-bar');
-            if (progressBar) progressBar.style.width = '0%';
-            const progressPercent = document.getElementById('db-progress-percent');
-            if (progressPercent) progressPercent.textContent = '0%';
-            const progressTime = document.getElementById('db-progress-time');
-            if (progressTime) progressTime.textContent = 'Remaining: ~0s';
-
-            const progressWrapper = document.getElementById('db-progress-wrapper');
-            if (progressWrapper) progressWrapper.style.display = 'block';
+            setDrawingControls(true);
+            setProgress(0, 'Remaining: ~0s');
 
             updateStatus('Loading image...', '#fbbf24');
 
@@ -1984,122 +1976,61 @@
             }
 
             updateStatus('Processing...', '#fbbf24');
-            const { grid, width, height } = processImage(img, step, colorsMode, denoiseLevel);
+            const processed = processImageCached(img, currentImageSrc, opts.step, opts.colorsMode, opts.denoiseLevel);
+            const plan = buildDrawPlan(processed, Object.assign({}, opts, { canvas, startStrokeId: strokeId }));
+            strokeId = plan.nextStrokeId;
 
-            const colors = new Set();
-            for (let x = 0; x < width; x++) {
-                for (let y = 0; y < height; y++) {
-                    colors.add(grid[x][y]);
-                }
-            }
-
-            let skippedColor = null;
-            if (fillBg && colors.size > 0) {
-                const counts = {};
-                for (let x = 0; x < width; x++) {
-                    for (let y = 0; y < height; y++) {
-                        const c = grid[x][y];
-                        counts[c] = (counts[c] || 0) + 1;
-                    }
-                }
-                let maxCount = 0;
-                let mostPopularColor = null;
-                for (let c in counts) {
-                    if (c === 'transparent') continue;
-                    if (counts[c] > maxCount) {
-                        maxCount = counts[c];
-                        mostPopularColor = c;
-                    }
-                }
-                if (mostPopularColor) {
-                    skippedColor = mostPopularColor;
-                }
-            }
-
-            const analysis = analyzeDrawingCommands(grid, width, height, fillBg, drawMode, batchSize, CFG.useBridge);
+            const totalCommands = plan.totalCommands || 1;
+            const currentDelay = (opts.drawMode === 'fill') ? fillInterval : CFG.packetDelay;
             let commandsSent = 0;
-            const totalCommands = analysis.totalCommands || 1;
-            let fillModeError = '';
-            let fastFillPacketsSent = 0;
-            let fastFillProbeChecked = false;
-            let fastFillProbeSupported = false;
-            let fastFillBaselineHash = null;
-            let fastFillVisualCheckInconclusive = false;
+            let packetsSent = 0;
+            let packetsFailed = 0;
+            let abortReason = '';
 
-            const currentDelay = (drawMode === 'fill') ? fillInterval : CFG.packetDelay;
             function updateProgress() {
                 const pct = Math.min(100, Math.round((commandsSent / totalCommands) * 100));
-                document.getElementById('db-progress-bar').style.width = `${pct}%`;
-                document.getElementById('db-progress-percent').textContent = `${pct}%`;
                 const estLeft = Math.max(0, Math.round(((totalCommands - commandsSent) * currentDelay) / 1000));
-                document.getElementById('db-progress-time').textContent = `Remaining: ~${estLeft}s`;
+                setProgress(pct, `Remaining: ~${estLeft}s`);
+            }
+
+            // Counts the outcome of one send; stops the run once the socket is gone,
+            // since every further packet would fail too
+            function trackSend(sent) {
+                if (sent) {
+                    packetsSent++;
+                    return;
+                }
+                if (cancelFlag) return;
+                packetsFailed++;
+                if (isSocketClosed()) {
+                    abortReason = 'Connection to the game was lost';
+                    cancelFlag = true;
+                }
             }
 
             // 1. Fill Background
-            if (skippedColor) {
-                updateStatus('Filling background...', skippedColor);
-                await sleep(150);
-                await sendFillPacket(strokeId++, skippedColor, canvas.width, canvas.height);
-                await sleep(150);
-                await sendFillPacket(strokeId++, skippedColor, canvas.width, canvas.height);
-
-                // Render background on screen in real-time
-                try {
-                    const ctx = canvas.getContext('2d');
-                    ctx.fillStyle = skippedColor;
-                    ctx.fillRect(0, 0, canvas.width, canvas.height);
-                } catch (e) {
-                    console.error('[DrawBot] Error rendering background on canvas:', e);
+            if (plan.background) {
+                const { hex, strokeIds } = plan.background;
+                updateStatus('Filling background...', hex);
+                for (const id of strokeIds) {
+                    await sleep(150);
+                    trackSend(await sendFillPacket(id, hex, canvas.width, canvas.height));
                 }
-
-                commandsSent += 2;
+                if (packetsSent > 0) {
+                    renderLocally(canvas, ctx => {
+                        ctx.fillStyle = hex;
+                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    });
+                }
+                commandsSent += strokeIds.length;
                 updateProgress();
             }
 
-            const colorsToDraw = Array.from(colors).filter(c => c !== skippedColor && c !== 'transparent');
-            let colorIndexGrid = null;
-            if (drawMode === 'fill') {
-                const islandCounts = new Map();
-                for (const color of colorsToDraw) {
-                    const colorGrid = new Uint8Array(width * height);
-                    for (let y = 0; y < height; y++) {
-                        const rowBase = y * width;
-                        for (let x = 0; x < width; x++) {
-                            if (grid[x][y] === color) {
-                                colorGrid[rowBase + x] = 1;
-                            }
-                        }
-                    }
-                    islandCounts.set(color, countIslands(colorGrid, width, height));
-                }
-                colorsToDraw.sort((a, b) => islandCounts.get(b) - islandCounts.get(a));
-
-                const colorToIndex = new Map();
-                for (let i = 0; i < colorsToDraw.length; i++) {
-                    colorToIndex.set(colorsToDraw[i], i);
-                }
-                colorIndexGrid = new Int32Array(width * height);
-                for (let y = 0; y < height; y++) {
-                    const rowBase = y * width;
-                    for (let x = 0; x < width; x++) {
-                        const color = grid[x][y];
-                        const idx = colorToIndex.get(color);
-                        colorIndexGrid[rowBase + x] = (idx !== undefined) ? idx : -1;
-                    }
-                }
-            }
-            if (drawMode === 'fill') {
-                fastFillBaselineHash = getCanvasSampleHash(canvas);
-                fastFillProbeSupported = fastFillBaselineHash !== null && fastFillBaselineHash !== undefined;
-                if (!fastFillProbeSupported) {
-                    console.warn('[DrawBot] Tool 8 application check unavailable: canvas hash could not be read.');
-                }
-            }
-
+            // 2. Colors
             let lastPacketTime = performance.now() - fillInterval;
-            for (let i = 0; i < colorsToDraw.length; i++) {
-                const hex = colorsToDraw[i];
+            for (let i = 0; i < plan.steps.length; i++) {
                 if (cancelFlag) break;
+                const { hex, frames, commands } = plan.steps[i];
 
                 // Small delay before switching to new color to prevent packet spam
                 if (i > 0) {
@@ -2107,245 +2038,83 @@
                     if (cancelFlag) break;
                 }
 
-                updateStatus(`Color ${i + 1}/${colorsToDraw.length} (${hex})`, hex);
+                const colorLabel = `Color ${i + 1}/${plan.steps.length} (${hex})`;
+                updateStatus(colorLabel, hex);
 
-                const colorGrid = new Uint8Array(width * height);
-                for (let y = 0; y < height; y++) {
-                    const rowBase = y * width;
-                    for (let x = 0; x < width; x++) {
-                        if (grid[x][y] === hex) {
-                            colorGrid[rowBase + x] = 1;
-                        }
-                    }
-                }
+                if (opts.drawMode === 'fill') {
+                    // --- Fast Fill Mode (Tool 8) ---
+                    const fillSendStart = performance.now();
+                    let fillSendCount = 0;
+                    for (const frameObj of frames) {
+                        await checkPause();
+                        if (cancelFlag) break;
 
-                if (drawMode === 'fill') {
-                    // --- Fast Fill Mode (Tool 8 with BFS Graph Algorithm) ---
-                    if (CFG.useBridge) {
-                        applyBridging(colorGrid, colorIndexGrid, width, height, hex, colorsToDraw, CFG.maxBridgeLength);
-                    }
-                    const result = generateFillBatchesFromGrid(colorGrid, width, height, hex, strokeId, step, scaleX, scaleY, canvas, batchSize);
+                        const sleepTime = Math.max(0, fillInterval - (performance.now() - lastPacketTime));
+                        const sent = await sendFillBatchPacket(frameObj.frame, frameObj.rectCount, sleepTime);
+                        lastPacketTime = performance.now();
+                        trackSend(sent);
 
-                    if (result.frames.length === 0) {
-                        console.warn(`[DrawBot] Color ${hex} skipped: BFS algorithm generated no rects.`);
-                        continue;
-                    }
-
-                    try {
-                        let fillSendStart = performance.now();
-                        let fillSendCount = 0;
-                        for (const frameObj of result.frames) {
-                            await checkPause();
-                            if (cancelFlag) break;
-
-                            const elapsedSinceLast = performance.now() - lastPacketTime;
-                            const sleepTime = Math.max(0, fillInterval - elapsedSinceLast);
-
-                            const sent = await sendFillBatchPacket(frameObj.frame, frameObj.rectCount, sleepTime);
-                            if (!sent && !cancelFlag) {
-                                console.warn('[DrawBot] Tool 8 packet failed to send after retries. Skipping this packet.');
-                            }
-                            lastPacketTime = performance.now();
-
-                            // Render on screen in real-time
-                            try {
-                                const ctx = canvas.getContext('2d');
+                        if (sent) {
+                            renderLocally(canvas, ctx => {
                                 ctx.fillStyle = hex;
                                 for (const r of frameObj.rects) {
                                     ctx.fillRect(r.x, r.y, r.w, r.h);
                                 }
-                            } catch (e) {
-                                console.error('[DrawBot] Error rendering on canvas:', e);
-                            }
-
-                            commandsSent++;
-                            fastFillPacketsSent++;
-                            fillSendCount++;
-
-                            // Show real-time send speed
-                            const elapsed = (performance.now() - fillSendStart) / 1000;
-                            const realPPS = elapsed > 0 ? (fillSendCount / elapsed).toFixed(1) : '—';
-                            updateStatus(`Color ${i + 1}/${colorsToDraw.length} (${hex}) — ${realPPS} pkt/s`, hex);
-                            updateProgress();
-
-                            if (!fastFillProbeChecked && fastFillProbeSupported && !cancelFlag) {
-                                fastFillProbeChecked = true;
-                                const changed = await checkCanvasChanged(canvas, fastFillBaselineHash);
-                                if (changed === false) {
-                                    fastFillVisualCheckInconclusive = true;
-                                    console.warn('[DrawBot] Local canvas did not change after Tool 8. Continuing: result will be verified at end of round.');
-                                }
-                            }
-                        }
-                        strokeId = result.nextStrokeId;
-                    } catch (err) {
-                        const code = err && err.message ? err.message : '';
-                        if (code === 'FAST_FILL_FRAME_TOO_LARGE') {
-                            fillModeError = 'Tool 8: frame too large even for a single rectangle';
-                        } else if (code === 'FAST_FILL_INVALID_PACKET') {
-                            fillModeError = 'Tool 8: invalid packet generated';
-                        } else if (code === 'FAST_FILL_SEND_FAILED') {
-                            fillModeError = 'Tool 8: packet send failed';
-                        } else {
-                            fillModeError = 'Tool 8: packet send error';
-                        }
-                        cancelFlag = true;
-                        break;
-                    }
-
-                } else {
-                    // --- Standard Mode (Lines and Squares) ---
-                    // --- Rectangles Phase ---
-                    const { rects, remainingGrid } = findMaxRectangles(colorGrid, width, height, 2, 2);
-                    for (let r of rects) {
-                        await checkPause();
-                        if (cancelFlag) break;
-
-                        let sx1 = Math.round(r.x * step * scaleX);
-                        let sy1 = Math.round(r.y * step * scaleY);
-                        let sx2 = Math.round((r.x + r.width) * step * scaleX);
-                        let sy2 = Math.round((r.y + r.height) * step * scaleY);
-
-                        await sendRectPacket(strokeId++, hex, thickness, sx1, sy1, sx2, sy2);
-
-                        // Render on screen in real-time
-                        try {
-                            const ctx = canvas.getContext('2d');
-                            ctx.strokeStyle = hex;
-                            ctx.lineWidth = thickness;
-                            ctx.lineCap = 'round';
-                            ctx.lineJoin = 'round';
-                            ctx.beginPath();
-                            ctx.moveTo(sx1, sy1);
-                            ctx.lineTo(sx2, sy2);
-                            ctx.stroke();
-                        } catch (e) {
-                            console.error('[DrawBot] Error rendering rectangle on canvas:', e);
+                            });
                         }
 
                         commandsSent++;
+                        fillSendCount++;
+
+                        // Show real-time send speed
+                        const elapsed = (performance.now() - fillSendStart) / 1000;
+                        const realPPS = elapsed > 0 ? (fillSendCount / elapsed).toFixed(1) : '—';
+                        updateStatus(`${colorLabel} — ${realPPS} pkt/s`, hex);
                         updateProgress();
                     }
-
-                    if (cancelFlag) break;
-
-                    // --- Strokes Phase ---
-                    const paths = findPaths(remainingGrid, width, height);
-                    for (let path of paths) {
+                } else {
+                    // --- Standard Mode (Lines and Squares) ---
+                    for (const cmd of commands) {
                         await checkPause();
                         if (cancelFlag) break;
 
-                        let isRect = false;
-                        let rx = 0, ry = 0, rw = 0, rh = 0;
-
-                        if (path.length === 1) {
-                            isRect = true;
-                            rx = path[0].x;
-                            ry = path[0].y;
-                            rw = 1;
-                            rh = 1;
+                        if (cmd.kind === 'rect') {
+                            const sent = await sendRectPacket(strokeId++, hex, thickness, cmd.x1, cmd.y1, cmd.x2, cmd.y2);
+                            trackSend(sent);
+                            if (sent) {
+                                renderLocally(canvas, ctx => strokeLocally(ctx, hex, thickness, [
+                                    { x: cmd.x1, y: cmd.y1 },
+                                    { x: cmd.x2, y: cmd.y2 }
+                                ]));
+                            }
                         } else {
-                            const first = path[0];
-                            const isHorizontal = path.every(p => p.y === first.y);
-                            const isVertical = path.every(p => p.x === first.x);
-
-                            if (isHorizontal) {
-                                isRect = true;
-                                const xs = path.map(p => p.x);
-                                const minX = Math.min(...xs);
-                                const maxX = Math.max(...xs);
-                                rx = minX;
-                                ry = first.y;
-                                rw = maxX - minX + 1;
-                                rh = 1;
-                            } else if (isVertical) {
-                                isRect = true;
-                                const ys = path.map(p => p.y);
-                                const minY = Math.min(...ys);
-                                const maxY = Math.max(...ys);
-                                rx = first.x;
-                                ry = minY;
-                                rw = 1;
-                                rh = maxY - minY + 1;
+                            const sent = await sendStrokePackets(strokeId++, hex, cmd.points, thickness);
+                            trackSend(sent);
+                            if (sent) {
+                                renderLocally(canvas, ctx => strokeLocally(ctx, hex, thickness, cmd.points));
                             }
                         }
 
-                        if (isRect) {
-                            let sx1 = Math.round(rx * step * scaleX);
-                            let sy1 = Math.round(ry * step * scaleY);
-                            let sx2 = Math.round((rx + rw) * step * scaleX);
-                            let sy2 = Math.round((ry + rh) * step * scaleY);
-
-                            await sendRectPacket(strokeId++, hex, thickness, sx1, sy1, sx2, sy2);
-
-                            // Render on screen in real-time
-                            try {
-                                const ctx = canvas.getContext('2d');
-                                ctx.strokeStyle = hex;
-                                ctx.lineWidth = thickness;
-                                ctx.lineCap = 'round';
-                                ctx.lineJoin = 'round';
-                                ctx.beginPath();
-                                ctx.moveTo(sx1, sy1);
-                                ctx.lineTo(sx2, sy2);
-                                ctx.stroke();
-                            } catch (e) {
-                                console.error('[DrawBot] Error rendering line on canvas:', e);
-                            }
-
-                            commandsSent++;
-                            updateProgress();
-                        } else {
-                            let screenPoints = path.map(p => ({
-                                x: Math.round((p.x * step + step / 2) * scaleX),
-                                y: Math.round((p.y * step + step / 2) * scaleY)
-                            }));
-                            screenPoints = simplifyPath(screenPoints);
-
-                            if (screenPoints.length > 0) {
-                                await sendStrokePackets(strokeId++, hex, screenPoints, thickness);
-
-                                // Render on screen in real-time
-                                try {
-                                    const ctx = canvas.getContext('2d');
-                                    ctx.strokeStyle = hex;
-                                    ctx.lineWidth = thickness;
-                                    ctx.lineCap = 'round';
-                                    ctx.lineJoin = 'round';
-                                    ctx.beginPath();
-                                    ctx.moveTo(screenPoints[0].x, screenPoints[0].y);
-                                    for (let pIdx = 1; pIdx < screenPoints.length; pIdx++) {
-                                        ctx.lineTo(screenPoints[pIdx].x, screenPoints[pIdx].y);
-                                    }
-                                    ctx.stroke();
-                                } catch (e) {
-                                    console.error('[DrawBot] Error rendering path on canvas:', e);
-                                }
-
-                                commandsSent += screenPoints.length > 1 ? 2 : 1;
-                                updateProgress();
-                            }
-                        }
+                        commandsSent += lineCommandWeight(cmd);
+                        updateProgress();
                     }
                 }
             }
 
-            if (!fillModeError && drawMode === 'fill' && colorsToDraw.length > 0 && fastFillPacketsSent === 0 && !cancelFlag) {
-                fillModeError = 'Tool 8 did not send any valid packets';
-            }
-
-            if (fillModeError) {
-                updateStatus(`❌ ${fillModeError}`, '#ef4444');
+            const elapsedSec = ((performance.now() - drawStartTime) / 1000).toFixed(1);
+            const attempted = packetsSent + packetsFailed;
+            if (abortReason) {
+                updateStatus(`❌ ${abortReason} (${packetsSent} packets sent)`, '#ef4444');
             } else if (cancelFlag) {
-                const elapsedSec = ((performance.now() - drawStartTime) / 1000).toFixed(1);
                 updateStatus(`⏹ Cancelled (${elapsedSec}s elapsed)`, '#ef4444');
+            } else if (attempted === 0) {
+                updateStatus('Nothing to draw: the image has no visible pixels.', '#fbbf24');
+            } else if (packetsSent === 0) {
+                updateStatus('❌ No packets could be sent. Check the connection and try again.', '#ef4444');
             } else {
-                const elapsedSec = ((performance.now() - drawStartTime) / 1000).toFixed(1);
-                document.getElementById('db-progress-bar').style.width = '100%';
-                document.getElementById('db-progress-percent').textContent = '100%';
-                document.getElementById('db-progress-time').textContent = `Done in ${elapsedSec}s!`;
-                if (drawMode === 'fill' && fastFillPacketsSent > 0 && (fastFillVisualCheckInconclusive || fastFillProbeSupported)) {
-                    updateStatus(`✅ Tool 8 packets sent in ${elapsedSec}s. (When you click "Done" the art will temporarily disappear, but it is fully saved and will be visible at the end of the game)`, '#10b981');
+                setProgress(100, `Done in ${elapsedSec}s!`);
+                if (packetsFailed > 0) {
+                    updateStatus(`⚠ Finished in ${elapsedSec}s, but ${packetsFailed} of ${attempted} packets failed to send. Some parts may be missing.`, '#fbbf24');
                 } else {
                     updateStatus(`✅ Drawing completed in ${elapsedSec}s! (When you click "Done" the art will temporarily disappear, but it is fully saved and will be visible at the end)`, '#10b981');
                 }
@@ -2354,7 +2123,10 @@
             console.error('[DrawBot] Critical error during drawing:', err);
             updateStatus('❌ Error during drawing', '#ef4444');
         } finally {
-            strokeIdCounter = strokeId;
+            // If the round changed mid-run, applyTurnId() already started a fresh sequence
+            if (CFG.currentTurnId === drawTurnId) {
+                strokeIdCounter = Math.max(strokeIdCounter, strokeId);
+            }
             resetDrawUI();
         }
     }
@@ -2366,7 +2138,7 @@
                 scale: document.getElementById('db-scale')?.value || '4',
                 colorsMode: document.getElementById('db-colors-mode')?.value || '8',
                 drawMode: document.getElementById('db-draw-mode')?.value || 'fill',
-                batchSize: document.getElementById('db-batch-size')?.value || '3000',
+                batchSize: document.getElementById('db-batch-size')?.value || String(BATCH_SIZE_DEFAULT),
                 delay: document.getElementById('db-delay')?.value || '127',
                 fillPPS: document.getElementById('db-fill-pps')?.value || '8',
                 denoise: document.getElementById('db-denoise-level')?.value || '0',
@@ -2392,6 +2164,23 @@
         } catch (e) {
             console.warn('[DrawBot] Failed to load settings:', e);
             return null;
+        }
+    }
+
+    // Applies a saved value only if the control can take it, so settings saved by older
+    // versions (missing keys, removed options, out-of-range numbers) keep the defaults
+    function applySavedValue(id, value) {
+        const el = document.getElementById(id);
+        if (!el || value === undefined || value === null) return;
+        if (el.type === 'checkbox') {
+            if (typeof value === 'boolean') el.checked = value;
+        } else if (el.tagName === 'SELECT') {
+            if (Array.from(el.options).some(o => o.value === String(value))) el.value = String(value);
+        } else if (el.type === 'number') {
+            const n = Number(value);
+            const min = el.min !== '' ? Number(el.min) : -Infinity;
+            const max = el.max !== '' ? Number(el.max) : Infinity;
+            if (Number.isFinite(n) && n >= min && n <= max) el.value = String(n);
         }
     }
 
@@ -2425,6 +2214,10 @@
                 user-select: none;
                 cursor: move;
             }
+            #db-panel.db-drop-active {
+                border-color: #a78bfa;
+                box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.6), 0 20px 25px -5px rgba(0,0,0,0.5);
+            }
             #db-panel:hover {
                 border-color: rgba(255, 255, 255, 0.18);
                 box-shadow: 0 25px 30px -5px rgba(0,0,0,0.6), 0 15px 15px -5px rgba(0,0,0,0.5);
@@ -2455,7 +2248,7 @@
             <div id="db-content">
                 <div style="margin-bottom: 12px;">
                     <div style="display: flex; gap: 6px; margin-bottom: 6px;">
-                        <input id="db-url" type="text" placeholder="Image URL" style="flex: 1; padding: 8px; background: #1e293b; border: 1px solid #334155; color: white; border-radius: 8px; font-size: 12px; outline: none; transition: border-color 0.2s;">
+                        <input id="db-url" type="text" placeholder="Image URL, Ctrl+V or drop" style="flex: 1; padding: 8px; background: #1e293b; border: 1px solid #334155; color: white; border-radius: 8px; font-size: 12px; outline: none; transition: border-color 0.2s;">
                         <button id="db-file-btn" style="background: #334155; border: 1px solid #475569; color: white; padding: 8px 12px; border-radius: 8px; font-size: 13px; cursor: pointer; transition: background 0.2s;">📁</button>
                     </div>
                     <input id="db-file" type="file" accept="image/*" style="display: none;">
@@ -2514,7 +2307,7 @@
                     </div>
                     <div id="db-batch-wrapper" style="flex: 1; font-size: 11px;">
                         <label style="display: block; margin-bottom: 4px; color: #94a3b8;">Rects per packet:</label>
-                        <input type="number" id="db-batch-size" min="1" max="1000" value="3000" style="width: 100%; box-sizing: border-box; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
+                        <input type="number" id="db-batch-size" min="1" max="9000" value="3000" style="width: 100%; box-sizing: border-box; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
                     </div>
                 </div>
 
@@ -2630,21 +2423,22 @@
         // Load saved settings
         const savedSetting = loadSettings();
         if (savedSetting) {
-            if (document.getElementById('db-scale')) document.getElementById('db-scale').value = savedSetting.scale;
-            if (document.getElementById('db-colors-mode')) document.getElementById('db-colors-mode').value = savedSetting.colorsMode;
-            if (document.getElementById('db-draw-mode')) document.getElementById('db-draw-mode').value = savedSetting.drawMode;
-            if (document.getElementById('db-batch-size')) document.getElementById('db-batch-size').value = savedSetting.batchSize;
-            if (document.getElementById('db-delay')) document.getElementById('db-delay').value = savedSetting.delay;
-            if (document.getElementById('db-fill-pps')) document.getElementById('db-fill-pps').value = savedSetting.fillPPS;
-            if (document.getElementById('db-denoise-level')) document.getElementById('db-denoise-level').value = savedSetting.denoise;
-            if (document.getElementById('db-fill-bg')) document.getElementById('db-fill-bg').checked = savedSetting.fillBg;
-            if (document.getElementById('db-use-bridge')) document.getElementById('db-use-bridge').checked = savedSetting.useBridge;
-            if (document.getElementById('db-bridge-len')) document.getElementById('db-bridge-len').value = savedSetting.bridgeLen;
-            if (savedSetting.layoutMode) layoutMode = savedSetting.layoutMode;
-            if (savedSetting.customX !== undefined) customX = savedSetting.customX;
-            if (savedSetting.customY !== undefined) customY = savedSetting.customY;
-            if (savedSetting.customW !== undefined) customW = savedSetting.customW;
-            if (savedSetting.customH !== undefined) customH = savedSetting.customH;
+            applySavedValue('db-scale', savedSetting.scale);
+            applySavedValue('db-colors-mode', savedSetting.colorsMode);
+            applySavedValue('db-draw-mode', savedSetting.drawMode);
+            applySavedValue('db-batch-size', savedSetting.batchSize);
+            applySavedValue('db-delay', savedSetting.delay);
+            applySavedValue('db-fill-pps', savedSetting.fillPPS);
+            applySavedValue('db-denoise-level', savedSetting.denoise);
+            applySavedValue('db-fill-bg', savedSetting.fillBg);
+            applySavedValue('db-use-bridge', savedSetting.useBridge);
+            applySavedValue('db-bridge-len', savedSetting.bridgeLen);
+            if (['stretch', 'center', 'custom'].includes(savedSetting.layoutMode)) layoutMode = savedSetting.layoutMode;
+            if (Number.isFinite(savedSetting.customX)) customX = savedSetting.customX;
+            if (Number.isFinite(savedSetting.customY)) customY = savedSetting.customY;
+            if (Number.isFinite(savedSetting.customW)) customW = savedSetting.customW;
+            if (Number.isFinite(savedSetting.customH)) customH = savedSetting.customH;
+            clampCustomBounds();
         }
 
         if (document.getElementById('db-layout-mode')) {
@@ -2674,189 +2468,162 @@
             }
         });
 
+        const urlInput = document.getElementById('db-url');
+
+        // Debounced preview: rendering is heavy, so wait until the user stops typing or clicking
+        let previewTimer = null;
+        const schedulePreview = () => {
+            clearTimeout(previewTimer);
+            previewTimer = setTimeout(() => processAndPreviewImage(currentImageSrc), PREVIEW_DEBOUNCE_MS);
+        };
+
+        // Single entry point for every image source: file picker, URL, paste, drag & drop
+        const setImageSource = (src, label) => {
+            currentImageSrc = src;
+            isApplied = false;
+            if (label !== undefined) urlInput.value = label;
+            updateStatus('Loading image...', '#fbbf24');
+            loadImage(src).then(img => {
+                if (currentImageSrc !== src) return; // replaced by a newer image meanwhile
+                draftImg = img;
+                // Fit the custom box to the image proportions, centered
+                const imgRatio = img.width / img.height;
+                const canvasRatio = 768 / 448;
+                if (imgRatio > canvasRatio) {
+                    customW = 400;
+                    customH = Math.round(400 / imgRatio);
+                } else {
+                    customH = 250;
+                    customW = Math.round(250 * imgRatio);
+                }
+                customX = Math.round((768 - customW) / 2);
+                customY = Math.round((448 - customH) / 2);
+                clampCustomBounds();
+                updateSliders();
+
+                if (layoutMode === 'custom') {
+                    drawDraftPreview();
+                } else {
+                    processAndPreviewImage(src);
+                }
+                updateStatus('Image loaded. Click Start.', '#a78bfa');
+            }).catch(() => {
+                if (currentImageSrc !== src) return;
+                // warn, not error: half-typed URLs fail all the time and must not flood the log
+                console.warn('[DrawBot] Could not load image:', src.slice(0, 100));
+                updateStatus('❌ Could not load image. If it is a link, download it and use 📁 instead.', '#ef4444');
+            });
+        };
+
+        const loadImageFile = (file) => {
+            if (!file || !file.type.startsWith('image/')) {
+                updateStatus('❌ Not an image file', '#ef4444');
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = (event) => setImageSource(event.target.result, file.name);
+            reader.onerror = () => updateStatus('❌ Could not read the file', '#ef4444');
+            reader.readAsDataURL(file);
+        };
+
         // File loading
         const fileBtn = document.getElementById('db-file-btn');
         const fileInput = document.getElementById('db-file');
         fileBtn.addEventListener('click', () => fileInput.click());
-
         fileInput.addEventListener('change', (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-            console.log('[DrawBot] File selected:', file.name);
-            const reader = new FileReader();
-            reader.onload = (event) => {
-                currentImageSrc = event.target.result;
-                console.log('[DrawBot] File loaded into memory, length:', currentImageSrc.length);
-                document.getElementById('db-url').value = file.name;
-                
-                // Preload draftImg and update layout bounds
-                loadImage(currentImageSrc).then(img => {
-                    draftImg = img;
-                    const imgRatio = img.width / img.height;
-                    const canvasRatio = 768 / 448;
-                    if (imgRatio > canvasRatio) {
-                        customW = 400;
-                        customH = Math.round(400 / imgRatio);
-                    } else {
-                        customH = 250;
-                        customW = Math.round(250 * imgRatio);
-                    }
-                    customX = Math.round((768 - customW) / 2);
-                    customY = Math.round((448 - customH) / 2);
-                    clampCustomBounds();
-                    updateSliders();
-                    
-                    if (layoutMode === 'custom') {
-                        drawDraftPreview();
-                        isApplied = false;
-                    } else {
-                        processAndPreviewImage(currentImageSrc);
-                        isApplied = true;
-                    }
-                }).catch(err => {
-                    console.error('[DrawBot] Error preloading draft image:', err);
-                    processAndPreviewImage(currentImageSrc);
-                    isApplied = true;
-                });
-                updateStatus('File loaded. Click Start.', '#a78bfa');
-            };
-            reader.readAsDataURL(file);
+            loadImageFile(e.target.files[0]);
+            fileInput.value = ''; // allow picking the same file again
         });
 
         // URL loading
-        const urlInput = document.getElementById('db-url');
-        urlInput.addEventListener('input', (e) => {
-            const val = e.target.value.trim();
-            if (val && (val.startsWith('http') || val.startsWith('data:'))) {
-                currentImageSrc = val;
-                loadImage(currentImageSrc).then(img => {
-                    draftImg = img;
-                    const imgRatio = img.width / img.height;
-                    const canvasRatio = 768 / 448;
-                    if (imgRatio > canvasRatio) {
-                        customW = 400;
-                        customH = Math.round(400 / imgRatio);
-                    } else {
-                        customH = 250;
-                        customW = Math.round(250 * imgRatio);
-                    }
-                    customX = Math.round((768 - customW) / 2);
-                    customY = Math.round((448 - customH) / 2);
-                    clampCustomBounds();
-                    updateSliders();
-                    
-                    if (layoutMode === 'custom') {
-                        drawDraftPreview();
-                        isApplied = false;
-                    } else {
-                        processAndPreviewImage(currentImageSrc);
-                        isApplied = true;
-                    }
-                }).catch(err => {
-                    console.error('[DrawBot] Error preloading draft image from URL:', err);
-                    processAndPreviewImage(currentImageSrc);
-                    isApplied = true;
-                });
-                updateStatus('Image loaded from URL.', '#a78bfa');
+        let urlTimer = null;
+        urlInput.addEventListener('input', () => {
+            clearTimeout(urlTimer);
+            urlTimer = setTimeout(() => {
+                const val = urlInput.value.trim();
+                if (val && (val.startsWith('http') || val.startsWith('data:'))) {
+                    setImageSource(val);
+                }
+            }, PREVIEW_DEBOUNCE_MS);
+        });
+
+        // Paste an image (Ctrl+V) anywhere on the page
+        window.addEventListener('paste', (e) => {
+            const target = e.target;
+            const inGameTextField = target && target.closest && !target.closest('#db-panel') &&
+                (target.isContentEditable || /^(INPUT|TEXTAREA)$/.test(target.tagName));
+            if (inGameTextField) return; // leave pastes into the game's own fields alone
+            const items = e.clipboardData ? Array.from(e.clipboardData.items) : [];
+            const imageItem = items.find(item => item.kind === 'file' && item.type.startsWith('image/'));
+            if (!imageItem) return; // plain text goes to the focused field as usual
+            e.preventDefault();
+            loadImageFile(imageItem.getAsFile());
+        }, true);
+
+        // Drag & drop an image file, or an image dragged from another tab, onto the panel
+        panel.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            panel.classList.add('db-drop-active');
+        });
+        panel.addEventListener('dragleave', (e) => {
+            if (!panel.contains(e.relatedTarget)) panel.classList.remove('db-drop-active');
+        });
+        panel.addEventListener('drop', (e) => {
+            e.preventDefault();
+            panel.classList.remove('db-drop-active');
+            const dt = e.dataTransfer;
+            if (!dt) return;
+            const file = Array.from(dt.files || []).find(f => f.type.startsWith('image/'));
+            if (file) {
+                loadImageFile(file);
+                return;
+            }
+            const url = (dt.getData('text/uri-list') || dt.getData('text/plain') || '').split('\n')[0].trim();
+            if (url.startsWith('http') || url.startsWith('data:')) {
+                setImageSource(url, url);
+            } else {
+                updateStatus('❌ Drop an image file or an image link', '#ef4444');
             }
         });
 
         // Preview updating triggers
         const handleTriggerUpdate = () => {
             saveSettings();
+            isApplied = false;
             if (layoutMode === 'custom') {
                 drawDraftPreview();
-                isApplied = false;
             } else {
-                processAndPreviewImage(currentImageSrc);
-                isApplied = true;
+                schedulePreview();
             }
         };
 
-        document.getElementById('db-scale').addEventListener('change', () => {
-            handleTriggerUpdate();
+        ['db-scale', 'db-colors-mode', 'db-denoise-level', 'db-fill-bg', 'db-use-bridge', 'db-draw-mode'].forEach(id => {
+            document.getElementById(id).addEventListener('change', handleTriggerUpdate);
         });
-        document.getElementById('db-colors-mode').addEventListener('change', () => {
-            handleTriggerUpdate();
+        // Number fields: their values are read and clamped by readDrawOptions()
+        ['db-batch-size', 'db-delay', 'db-fill-pps', 'db-bridge-len'].forEach(id => {
+            document.getElementById(id).addEventListener('input', handleTriggerUpdate);
         });
-        document.getElementById('db-denoise-level').addEventListener('change', () => {
-            handleTriggerUpdate();
-        });
-        document.getElementById('db-fill-bg').addEventListener('change', () => {
-            handleTriggerUpdate();
-        });
-        document.getElementById('db-use-bridge').addEventListener('change', () => {
-            handleTriggerUpdate();
-        });
- 
-         const drawModeSelect = document.getElementById('db-draw-mode');
-         const batchWrapper = document.getElementById('db-batch-wrapper');
-         drawModeSelect.addEventListener('change', () => {
-             handleTriggerUpdate();
-         });
- 
-         document.getElementById('db-batch-size').addEventListener('input', () => {
-             let val = parseInt(document.getElementById('db-batch-size').value, 10);
-             if (isNaN(val) || val < 1) val = 1;
-             handleTriggerUpdate();
-         });
- 
-         const delayInput = document.getElementById('db-delay');
-         delayInput.addEventListener('input', () => {
-             let delay = parseInt(delayInput.value, 10);
-             if (isNaN(delay) || delay < 0) delay = 0;
-             CFG.packetDelay = delay;
-             handleTriggerUpdate();
-         });
- 
-         const fillPPSInput = document.getElementById('db-fill-pps');
-         fillPPSInput.addEventListener('input', () => {
-             let val = parseInt(fillPPSInput.value, 10);
-             if (isNaN(val) || val < 1) val = 1;
-             if (val > 30) val = 30;
-             CFG.fillPPS = val;
-             handleTriggerUpdate();
-         });
- 
-         const bridgeLenInput = document.getElementById('db-bridge-len');
-         if (bridgeLenInput) {
-             bridgeLenInput.addEventListener('input', () => {
-                 let val = parseInt(bridgeLenInput.value, 10);
-                 if (isNaN(val) || val < 1) val = 1;
-                 if (val > 150) val = 150;
-                 CFG.maxBridgeLength = val;
-                 handleTriggerUpdate();
-             });
-         }
 
         // Show/hide PPS and Delay depending on drawing mode
+        const drawModeSelect = document.getElementById('db-draw-mode');
+        const batchWrapper = document.getElementById('db-batch-wrapper');
         const fillPPSWrapper = document.getElementById('db-fill-pps-wrapper');
         const delayWrapper = document.getElementById('db-delay-wrapper');
         const bridgeWrapper = document.getElementById('db-bridge-wrapper');
         const bridgeLenWrapper = document.getElementById('db-bridge-len-wrapper');
+        const useBridgeCheckbox = document.getElementById('db-use-bridge');
         const updateFillPPSVisibility = () => {
             const isFill = drawModeSelect.value === 'fill';
-            const useBridge = document.getElementById('db-use-bridge') ? document.getElementById('db-use-bridge').checked : false;
-            if (fillPPSWrapper) {
-                fillPPSWrapper.style.display = isFill ? 'flex' : 'none';
-            }
-            if (delayWrapper) {
-                delayWrapper.style.display = isFill ? 'none' : 'flex';
-            }
-            if (bridgeWrapper) {
-                bridgeWrapper.style.display = isFill ? 'flex' : 'none';
-            }
-            if (bridgeLenWrapper) {
-                bridgeLenWrapper.style.display = (isFill && useBridge) ? 'flex' : 'none';
-            }
-            if (batchWrapper) {
-                batchWrapper.style.display = isFill ? 'block' : 'none';
-            }
+            const useBridge = useBridgeCheckbox ? useBridgeCheckbox.checked : false;
+            if (fillPPSWrapper) fillPPSWrapper.style.display = isFill ? 'flex' : 'none';
+            if (delayWrapper) delayWrapper.style.display = isFill ? 'none' : 'flex';
+            if (bridgeWrapper) bridgeWrapper.style.display = isFill ? 'flex' : 'none';
+            if (bridgeLenWrapper) bridgeLenWrapper.style.display = (isFill && useBridge) ? 'flex' : 'none';
+            if (batchWrapper) batchWrapper.style.display = isFill ? 'block' : 'none';
         };
         drawModeSelect.addEventListener('change', updateFillPPSVisibility);
-        if (document.getElementById('db-use-bridge')) {
-            document.getElementById('db-use-bridge').addEventListener('change', updateFillPPSVisibility);
-        }
+        if (useBridgeCheckbox) useBridgeCheckbox.addEventListener('change', updateFillPPSVisibility);
         updateFillPPSVisibility();
 
         // Round (turn ID): auto-detected, can be overridden by hand
@@ -2871,7 +2638,7 @@
                 // A hand-typed value must not be overwritten by the next captured packet
                 turnIdAuto = false;
                 turnAutoCheckbox.checked = false;
-                CFG.currentTurnId = roundToTurnId(round);
+                applyTurnId(roundToTurnId(round));
                 console.log('[DrawBot] Round set manually:', round, '(turnId', CFG.currentTurnId + ')');
             });
             turnAutoCheckbox.addEventListener('change', () => {
@@ -2883,20 +2650,19 @@
         // Layout change handler
         const layoutSelect = document.getElementById('db-layout-mode');
         const customSliders = document.getElementById('db-custom-sliders');
-        
+
         if (layoutSelect) {
             layoutSelect.addEventListener('change', () => {
                 layoutMode = layoutSelect.value;
                 saveSettings();
+                isApplied = false;
                 if (layoutMode === 'custom') {
                     if (customSliders) customSliders.style.display = 'block';
                     updateSliders();
                     drawDraftPreview();
-                    isApplied = false;
                 } else {
                     if (customSliders) customSliders.style.display = 'none';
                     processAndPreviewImage(currentImageSrc);
-                    isApplied = true;
                 }
             });
         }
@@ -2906,29 +2672,28 @@
         const hSlider = document.getElementById('db-custom-h');
         const xSlider = document.getElementById('db-custom-x');
         const ySlider = document.getElementById('db-custom-y');
-        
+
         const onSliderInput = () => {
             if (wSlider) customW = parseInt(wSlider.value, 10);
             if (hSlider) customH = parseInt(hSlider.value, 10);
             if (xSlider) customX = parseInt(xSlider.value, 10);
             if (ySlider) customY = parseInt(ySlider.value, 10);
-            
+
             clampCustomBounds();
             updateSliders();
             drawDraftPreview();
             isApplied = false;
         };
-        
-        if (wSlider) wSlider.addEventListener('input', onSliderInput);
-        if (hSlider) hSlider.addEventListener('input', onSliderInput);
-        if (xSlider) xSlider.addEventListener('input', onSliderInput);
-        if (ySlider) ySlider.addEventListener('input', onSliderInput);
-        
+
+        [wSlider, hSlider, xSlider, ySlider].forEach(slider => {
+            if (slider) slider.addEventListener('input', onSliderInput);
+        });
+
         const customApplyBtn = document.getElementById('db-custom-apply');
         if (customApplyBtn) {
             customApplyBtn.addEventListener('click', () => {
+                saveSettings();
                 processAndPreviewImage(currentImageSrc);
-                isApplied = true;
             });
         }
 
@@ -2942,18 +2707,16 @@
         // Drawing control triggers
         document.getElementById('db-start').addEventListener('click', () => {
             if (!currentImageSrc) {
-                alert('Please load an image first (file or URL)!');
+                alert('Please load an image first (file, URL, Ctrl+V or drag & drop)!');
                 return;
             }
             runDraw();
         });
 
-
-
         const pauseBtn = document.getElementById('db-pause');
         pauseBtn.addEventListener('click', () => {
-            console.log('[DrawBot] Pause button clicked. State changes to:', !isPaused);
             isPaused = !isPaused;
+            debugLog('[DrawBot] Pause toggled:', isPaused);
             if (isPaused) {
                 pauseBtn.textContent = '▶ Resume';
                 pauseBtn.style.background = '#059669';
@@ -2966,7 +2729,7 @@
         });
 
         document.getElementById('db-cancel').addEventListener('click', () => {
-            console.log('[DrawBot] Cancel button clicked. cancelFlag set to true.');
+            debugLog('[DrawBot] Cancel requested.');
             cancelFlag = true;
             isPaused = false;
         });
