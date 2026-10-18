@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gartic Phone DrawBot
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      2.0
 // @description  Automated drawing bot with WebSocket interception, image loading, color quantization, preview and progress indicator
 // @author       NotLun1x
 // @match        https://garticphone.com/*
@@ -68,35 +68,20 @@
     }
 
     const SETTINGS_KEY = 'drawbot_settings_v1';
+    // Runtime values shared by the socket hooks and the packet senders.
+    // Everything else is read from the panel by readDrawOptions().
     function loadInitialCFG() {
-        const defaults = {
-            downscale: 4,
-            denoise: false,
-            packetDelay: 127,
-            fillPPS: 8,
-            fillBg: false,
-            useBridge: true,
-            maxBridgeLength: 50,
-            colorsMode: '8',
-            currentTurnId: 0
-        };
+        const cfg = { packetDelay: 127, currentTurnId: 0 };
         try {
-            const data = localStorage.getItem(SETTINGS_KEY);
-            if (data) {
-                const saved = JSON.parse(data);
-                defaults.downscale = parseInt(saved.scale, 10) || 4;
-                defaults.packetDelay = parseInt(saved.delay, 10) || 127;
-                defaults.fillPPS = parseInt(saved.fillPPS, 10) || 8;
-                defaults.fillBg = saved.fillBg !== undefined ? saved.fillBg : false;
-                defaults.useBridge = saved.useBridge !== undefined ? saved.useBridge : true;
-                defaults.maxBridgeLength = parseInt(saved.bridgeLen, 10) || 50;
-                defaults.colorsMode = saved.colorsMode || '8';
-            }
+            const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
+            const delay = saved ? parseInt(saved.delay, 10) : NaN;
+            if (!isNaN(delay) && delay >= 0) cfg.packetDelay = delay;
         } catch (e) { }
-        return defaults;
+        return cfg;
     }
     const CFG = loadInitialCFG();
-    const FAST_FILL_MAX_FRAME_CHARS = 500000;
+    // Safety cap on one frame; a 24 000-rect packet (~440 KB) was accepted in a live game
+    const FAST_FILL_MAX_FRAME_CHARS = 700000;
     const HEX_COLOR_RE = /^#[0-9A-F]{6}$/i;
 
     let wsInstance = null;
@@ -551,9 +536,40 @@
         return (2 + rMean / 256) * r * r + 4 * g * g + (2 + (255 - rMean) / 256) * b * b;
     }
 
+    // Above this many distinct colors, near-identical shades are merged before clustering
+    const QUANTIZE_BIN_THRESHOLD = 4096;
+
     function quantize(pixels, maxColors) {
         if (pixels.length <= maxColors) {
             return pixels.map(p => ({ r: p.r, g: p.g, b: p.b }));
+        }
+
+        // Photos at 1x have 100k+ distinct colors and every clustering pass runs over all of
+        // them. Shades within 8 levels per channel are merged into their weighted average
+        // (at most 32 768 entries); cluster centers are weighted averages anyway.
+        if (pixels.length > QUANTIZE_BIN_THRESHOLD) {
+            const bins = new Map();
+            for (const p of pixels) {
+                const key = ((p.r >> 3) << 10) | ((p.g >> 3) << 5) | (p.b >> 3);
+                const bin = bins.get(key);
+                if (bin) {
+                    bin.sumR += p.r * p.count;
+                    bin.sumG += p.g * p.count;
+                    bin.sumB += p.b * p.count;
+                    bin.count += p.count;
+                } else {
+                    bins.set(key, { sumR: p.r * p.count, sumG: p.g * p.count, sumB: p.b * p.count, count: p.count });
+                }
+            }
+            pixels = Array.from(bins.values(), b => ({
+                r: Math.round(b.sumR / b.count),
+                g: Math.round(b.sumG / b.count),
+                b: Math.round(b.sumB / b.count),
+                count: b.count
+            }));
+            if (pixels.length <= maxColors) {
+                return pixels.map(p => ({ r: p.r, g: p.g, b: p.b }));
+            }
         }
 
         pixels.sort((a, b) => b.count - a.count);
@@ -607,6 +623,40 @@
             }
         }
 
+        // The pass above only opens a cluster for a color far from every existing one, so on real
+        // images it stops well short of large palettes (about 70-90 colors for 128/256). Fill the
+        // remaining slots where the error is largest: the color with the biggest distance to its
+        // nearest center, weighted by how often it occurs, becomes the next center.
+        if (clusters.length < maxColors) {
+            const minDist = new Float64Array(pixels.length);
+            for (let i = 0; i < pixels.length; i++) {
+                let best = Infinity;
+                for (const c of clusters) {
+                    const d = getDistance(pixels[i], c.center);
+                    if (d < best) best = d;
+                }
+                minDist[i] = best;
+            }
+            while (clusters.length < maxColors) {
+                let pick = -1;
+                let pickScore = 0;
+                for (let i = 0; i < pixels.length; i++) {
+                    const score = minDist[i] * pixels[i].count;
+                    if (score > pickScore) {
+                        pickScore = score;
+                        pick = i;
+                    }
+                }
+                if (pick === -1) break; // every color is a center already
+                const center = { r: pixels[pick].r, g: pixels[pick].g, b: pixels[pick].b };
+                clusters.push({ center });
+                for (let i = 0; i < pixels.length; i++) {
+                    const d = getDistance(pixels[i], center);
+                    if (d < minDist[i]) minDist[i] = d;
+                }
+            }
+        }
+
         // K-Means refinement passes (3 iterations)
         let centers = clusters.map(c => ({ r: c.center.r, g: c.center.g, b: c.center.b }));
         for (let iter = 0; iter < 3; iter++) {
@@ -653,11 +703,34 @@
     }
 
     function getGameCanvas() {
-        const all = [...document.querySelectorAll('canvas')];
+        // The panel's own preview canvas is 768×448 at 1x and must not pass for the game's
+        const all = [...document.querySelectorAll('canvas')].filter(c => !c.closest('#db-panel'));
         if (!all.length) return null;
         const largest = all.reduce((a, b) => (a.width * a.height >= b.width * b.height ? a : b));
         if (largest.width >= 400) return largest;
         return null;
+    }
+
+    // Canvas size to plan for. Plans depend on it (rect rounding, where invisible bridges fit),
+    // and the game canvas only exists during the drawing round, so the last size seen is kept
+    const CANVAS_SIZE_KEY = 'drawbot_canvas_size_v1';
+    const DEFAULT_GAME_CANVAS = { width: 1516, height: 848 }; // what the game used on desktop in tests
+    function rememberCanvasSize(canvas) {
+        try {
+            localStorage.setItem(CANVAS_SIZE_KEY, JSON.stringify({ width: canvas.width, height: canvas.height }));
+        } catch (e) { }
+    }
+    function planningCanvas() {
+        const canvas = getGameCanvas();
+        if (canvas) {
+            rememberCanvasSize(canvas);
+            return canvas;
+        }
+        try {
+            const saved = JSON.parse(localStorage.getItem(CANVAS_SIZE_KEY) || 'null');
+            if (saved && saved.width >= 400 && saved.height > 0) return saved;
+        } catch (e) { }
+        return DEFAULT_GAME_CANVAS;
     }
 
     function clampInt(n, min, max) {
@@ -680,8 +753,9 @@
                 !Number.isInteger(rect.w) ||
                 !Number.isInteger(rect.h) ||
                 (rect.parentIndex !== undefined && !Number.isInteger(rect.parentIndex)) ||
-                rect.w < 1 ||
-                rect.h < 1
+                // Invisible bridges are zero-size by design; everything else must paint something
+                rect.w < (rect.bridge ? 0 : 1) ||
+                rect.h < (rect.bridge ? 0 : 1)
             ) {
                 return null;
             }
@@ -886,268 +960,557 @@
         return count;
     }
 
-    function applyBridging(colorGrid, colorIndexGrid, width, height, hexColor, colorsToDraw, maxBridgeLength = 8) {
-        const indexC = colorsToDraw.indexOf(hexColor);
-        if (indexC === -1) return;
+    // Grid-sized scratch arrays for Smart Bridges, shared by all colors of a plan
+    let bridgeScratch = null;
+    function getBridgeScratch(size) {
+        if (!bridgeScratch || bridgeScratch.size !== size) {
+            bridgeScratch = {
+                size,
+                comp: new Int32Array(size),
+                queue: new Int32Array(size),
+                dist: new Int32Array(size),
+                origin: new Int32Array(size),
+                prev: new Int32Array(size)
+            };
+        }
+        return bridgeScratch;
+    }
 
-        // 1. Create bridgeable map from colorIndexGrid
-        const isBridgeable = new Uint8Array(width * height);
-        for (let y = 0; y < height; y++) {
-            const rowBase = y * width;
-            for (let x = 0; x < width; x++) {
-                const key = rowBase + x;
-                const idx = colorIndexGrid[key];
-                if (idx === indexC || idx > indexC) {
-                    isBridgeable[key] = 1;
+    // Connects the islands of one color with bridges over pixels of colors drawn after it
+    // (they get painted over anyway). Bridges have no length limit: a long bridge only costs
+    // rectangles, while every island it removes saves a whole packet. The search stays inside
+    // the color's bounding box (a bridge rarely needs to leave it, and Invisible bridges link
+    // whatever is left), so small colors cost little even at 1x.
+    // `indexC` is the color's position in the draw order, `box` its bounding box
+    // ({ minX, minY, maxX, maxY }, inclusive)
+    function applyBridging(colorGrid, colorIndexGrid, width, height, indexC, box) {
+        const { minX, minY, maxX, maxY } = box;
+
+        const { comp, queue, dist, origin, prev } = getBridgeScratch(width * height);
+        for (let y = minY; y <= maxY; y++) {
+            comp.fill(-1, y * width + minX, y * width + maxX + 1);
+            dist.fill(-1, y * width + minX, y * width + maxX + 1);
+        }
+
+        // 1. Islands of this color
+        let islands = 0;
+        for (let y = minY; y <= maxY; y++) {
+            for (let x = minX; x <= maxX; x++) {
+                const start = y * width + x;
+                if (!colorGrid[start] || comp[start] !== -1) continue;
+                let head = 0;
+                let tail = 0;
+                queue[tail++] = start;
+                comp[start] = islands;
+                while (head < tail) {
+                    const key = queue[head++];
+                    const kx = key % width;
+                    const ky = (key - kx) / width;
+                    if (kx > minX && colorGrid[key - 1] && comp[key - 1] === -1) { comp[key - 1] = islands; queue[tail++] = key - 1; }
+                    if (kx < maxX && colorGrid[key + 1] && comp[key + 1] === -1) { comp[key + 1] = islands; queue[tail++] = key + 1; }
+                    if (ky > minY && colorGrid[key - width] && comp[key - width] === -1) { comp[key - width] = islands; queue[tail++] = key - width; }
+                    if (ky < maxY && colorGrid[key + width] && comp[key + width] === -1) { comp[key + width] = islands; queue[tail++] = key + width; }
                 }
+                islands++;
             }
         }
+        if (islands <= 1) return;
 
-        // 2. Find connected components of colorGrid
-        const visited = new Uint8Array(width * height);
-        const components = [];
-        const pixelToComp = new Int32Array(width * height).fill(-1);
-        const compQueue = new Int32Array(width * height);
-
-        for (let y = 0; y < height; y++) {
-            const rowBase = y * width;
-            for (let x = 0; x < width; x++) {
-                const startKey = rowBase + x;
-                if (colorGrid[startKey] && !visited[startKey]) {
-                    const compIdx = components.length;
-                    const comp = [];
-                    let head = 0;
-                    let tail = 0;
-                    compQueue[tail++] = startKey;
-                    visited[startKey] = 1;
-
-                    while (head < tail) {
-                        const currKey = compQueue[head++];
-                        comp.push(currKey);
-                        pixelToComp[currKey] = compIdx;
-
-                        const cx = currKey % width;
-                        const cy = Math.floor(currKey / width);
-
-                        const dirs = [[0, 1], [0, -1], [1, 0], [-1, 0]];
-                        for (const [dx, dy] of dirs) {
-                            const nx = cx + dx;
-                            const ny = cy + dy;
-                            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                                const nKey = ny * width + nx;
-                                if (colorGrid[nKey] && !visited[nKey]) {
-                                    visited[nKey] = 1;
-                                    compQueue[tail++] = nKey;
-                                }
-                            }
-                        }
-                    }
-                    components.push(comp);
-                }
+        const parent = new Int32Array(islands);
+        for (let i = 0; i < islands; i++) parent[i] = i;
+        let separate = islands; // the search stops once every island is joined
+        const find = (i) => {
+            while (parent[i] !== i) {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
             }
-        }
+            return i;
+        };
 
-        if (components.length <= 1) return;
-
-        // Parent pointer array for union-find on components
-        const parent = Array(components.length).fill(0).map((_, i) => i);
-        function find(i) {
-            let root = i;
-            while (parent[root] !== root) root = parent[root];
-            let curr = i;
-            while (curr !== root) {
-                const next = parent[curr];
-                parent[curr] = root;
-                curr = next;
-            }
-            return root;
-        }
-        function union(i, j) {
-            const rootI = find(i);
-            const rootJ = find(j);
-            if (rootI !== rootJ) {
-                parent[rootI] = rootJ;
-                return true;
-            }
-            return false;
-        }
-
-        // Multi-source BFS structures
-        const bfsQueue = new Int32Array(width * height);
-        const dist = new Int16Array(width * height).fill(-1);
-        const origin = new Int32Array(width * height).fill(-1);
-        const prev = new Int32Array(width * height).fill(-1);
+        // 2. Multi-source BFS from the island borders through cells of this and later colors
         let tail = 0;
-
-        // Initialize queue with all boundary pixels of all components
-        for (let c = 0; c < components.length; c++) {
-            for (const key of components[c]) {
-                const px = key % width;
-                const py = Math.floor(key / width);
-                let isBoundary = false;
-                const dirs = [[0, 1], [0, -1], [1, 0], [-1, 0]];
-                for (const [dx, dy] of dirs) {
-                    const nx = px + dx;
-                    const ny = py + dy;
-                    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                        if (!colorGrid[ny * width + nx]) {
-                            isBoundary = true;
-                            break;
-                        }
-                    } else {
-                        isBoundary = true;
-                        break;
-                    }
-                }
-                if (isBoundary) {
-                    bfsQueue[tail++] = key;
-                    dist[key] = 0;
-                    origin[key] = c;
-                }
+        for (let y = minY; y <= maxY; y++) {
+            for (let x = minX; x <= maxX; x++) {
+                const key = y * width + x;
+                if (comp[key] === -1) continue;
+                const border = x === 0 || x === width - 1 || y === 0 || y === height - 1 ||
+                    !colorGrid[key - 1] || !colorGrid[key + 1] || !colorGrid[key - width] || !colorGrid[key + width];
+                if (!border) continue;
+                queue[tail++] = key;
+                dist[key] = 0;
+                origin[key] = comp[key];
             }
         }
+
+        const markPath = (key) => {
+            while (key !== -1 && dist[key] > 0) {
+                colorGrid[key] = 1;
+                key = prev[key];
+            }
+        };
+        const visit = (from, to) => {
+            if (colorIndexGrid[to] < indexC) return; // earlier colors, background and transparency stay as they are
+            if (dist[to] === -1) {
+                dist[to] = dist[from] + 1;
+                origin[to] = origin[from];
+                prev[to] = from;
+                queue[tail++] = to;
+                return;
+            }
+            const a = find(origin[from]);
+            const b = find(origin[to]);
+            if (a === b) return;
+            parent[a] = b;
+            separate--;
+            markPath(from);
+            markPath(to);
+        };
 
         let head = 0;
-        while (head < tail) {
-            const currKey = bfsQueue[head++];
-            const currDist = dist[currKey];
-            const currOrigin = origin[currKey];
-
-            if (currDist >= maxBridgeLength) continue;
-
-            const cx = currKey % width;
-            const cy = Math.floor(currKey / width);
-
-            const dirs = [[0, 1], [0, -1], [1, 0], [-1, 0]];
-            for (const [dx, dy] of dirs) {
-                const nx = cx + dx;
-                const ny = cy + dy;
-                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                    const nKey = ny * width + nx;
-                    if (isBridgeable[nKey]) {
-                        if (dist[nKey] === -1) {
-                            dist[nKey] = currDist + 1;
-                            origin[nKey] = currOrigin;
-                            prev[nKey] = currKey;
-                            bfsQueue[tail++] = nKey;
-                        } else {
-                            const otherOrigin = origin[nKey];
-                            if (find(currOrigin) !== find(otherOrigin)) {
-                                if (currDist + dist[nKey] <= maxBridgeLength) {
-                                    union(currOrigin, otherOrigin);
-
-                                    // Backtrack from currKey
-                                    let k1 = currKey;
-                                    while (k1 !== -1 && dist[k1] > 0) {
-                                        colorGrid[k1] = 1;
-                                        k1 = prev[k1];
-                                    }
-
-                                    // Backtrack from nKey
-                                    let k2 = nKey;
-                                    while (k2 !== -1 && dist[k2] > 0) {
-                                        colorGrid[k2] = 1;
-                                        k2 = prev[k2];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        while (head < tail && separate > 1) {
+            const key = queue[head++];
+            const kx = key % width;
+            const ky = (key - kx) / width;
+            if (kx > minX) visit(key, key - 1);
+            if (kx < maxX) visit(key, key + 1);
+            if (ky > minY) visit(key, key - width);
+            if (ky < maxY) visit(key, key + width);
         }
     }
 
+    // Packs one color's rectangles into packets. A packet must be one connected tree: every rect
+    // after the first names an earlier rect it touches as its parent. A tree larger than the limit
+    // is cut into connected pieces bottom-up: a rect whose subtree grows past the limit hands its
+    // largest child subtrees off to packets of their own. This greedy gives the fewest pieces
+    // for a size bound, and cut-off pieces stay whole subtrees instead of single stray rects.
     function splitIntoChunks(rects, hexColor, startStrokeId, maxRectsPerChunk) {
-        const chunks = [];
-        let currentChunkRects = [];
-        let rectToLocalIndex = new Map();
-        let currentStrokeId = startStrokeId;
-        const chunkLimit = (Number.isInteger(maxRectsPerChunk) && maxRectsPerChunk > 0) ? maxRectsPerChunk : Infinity;
-
-        // Base length of packet serialization:
-        // wsPrefix + '{"t":' + turnId + ',"d":1,"v":[8,' + strokeId + ',["' + hexColor + '",10]]}' + ']'
+        // Longest possible rect entry: four coordinates of up to 4 digits, a 6-digit parent offset, commas
+        const maxRectChars = 4 * 4 + 6 + 5;
         const baseLength = wsPrefix.length + 50 + hexColor.length;
-        let currentEstimatedLength = baseLength;
+        const charLimit = Math.max(1, Math.floor((FAST_FILL_MAX_FRAME_CHARS - baseLength) / maxRectChars));
+        const countLimit = (Number.isInteger(maxRectsPerChunk) && maxRectsPerChunk > 0) ? maxRectsPerChunk : Infinity;
+        const limit = Math.min(charLimit, countLimit);
 
-        for (let i = 0; i < rects.length; i++) {
-            const rect = rects[i];
-
-            const currentOrig = rect.originalRect || rect;
-            const parentOrig = currentOrig.parentRef;
-
-            let parentIndex;
-            let shouldForceSplit = false;
-
-            if (parentOrig === null || parentOrig === undefined) {
-                parentIndex = 0;
-                if (currentChunkRects.length > 0) {
-                    shouldForceSplit = true;
-                }
-            } else if (rectToLocalIndex.has(parentOrig)) {
-                parentIndex = rectToLocalIndex.get(parentOrig) * 5;
-            } else {
-                parentIndex = 0;
-                if (currentChunkRects.length > 0) {
-                    shouldForceSplit = true;
-                }
+        // Rects come in discovery order, so a parent always has a lower index than its children
+        const n = rects.length;
+        const indexOfOriginal = new Map();
+        rects.forEach((rect, i) => indexOfOriginal.set(rect.originalRect || rect, i));
+        const parent = new Int32Array(n).fill(-1);
+        const children = Array.from({ length: n }, () => []);
+        for (let i = 0; i < n; i++) {
+            const parentOrig = (rects[i].originalRect || rects[i]).parentRef;
+            const p = parentOrig ? indexOfOriginal.get(parentOrig) : undefined;
+            if (p !== undefined && p < i) {
+                parent[i] = p;
+                children[p].push(i);
             }
-
-            const scaledRect = {
-                x: rect.x,
-                y: rect.y,
-                w: rect.w,
-                h: rect.h,
-                parentIndex: parentIndex
-            };
-
-            const rectStrLength =
-                String(scaledRect.x).length +
-                String(scaledRect.y).length +
-                String(scaledRect.w).length +
-                String(scaledRect.h).length +
-                String(scaledRect.parentIndex).length + 5;
-
-            if (shouldForceSplit ||
-                currentChunkRects.length >= chunkLimit ||
-                (currentEstimatedLength + rectStrLength > FAST_FILL_MAX_FRAME_CHARS)) {
-
-                if (currentChunkRects.length > 0) {
-                    const res = buildFillBatchFrame(currentStrokeId, hexColor, currentChunkRects);
-                    const frame = res ? res.frame : null;
-                    chunks.push({ frame, strokeId: currentStrokeId, rectCount: currentChunkRects.length, rects: [...currentChunkRects] });
-                    currentStrokeId++;
-                }
-
-                scaledRect.parentIndex = 0;
-                currentChunkRects = [scaledRect];
-                rectToLocalIndex.clear();
-                rectToLocalIndex.set(currentOrig, 0);
-                currentEstimatedLength = baseLength +
-                    String(scaledRect.x).length +
-                    String(scaledRect.y).length +
-                    String(scaledRect.w).length +
-                    String(scaledRect.h).length +
-                    String(0).length + 5;
-                continue;
-            }
-
-            currentChunkRects.push(scaledRect);
-            rectToLocalIndex.set(currentOrig, currentChunkRects.length - 1);
-            currentEstimatedLength += rectStrLength;
         }
 
-        if (currentChunkRects.length > 0) {
-            const res = buildFillBatchFrame(currentStrokeId, hexColor, currentChunkRects);
-            const frame = res ? res.frame : null;
-            chunks.push({ frame, strokeId: currentStrokeId, rectCount: currentChunkRects.length, rects: [...currentChunkRects] });
+        // Bottom-up pass: size[i] = rects that stay in i's packet; cut[i] = i starts a packet
+        const size = new Int32Array(n);
+        const cut = new Uint8Array(n);
+        for (let i = n - 1; i >= 0; i--) {
+            let total = 1;
+            for (const k of children[i]) total += size[k];
+            if (total > limit) {
+                const bySize = children[i].slice().sort((a, b) => size[b] - size[a]);
+                for (const k of bySize) {
+                    if (total <= limit) break;
+                    cut[k] = 1;
+                    total -= size[k];
+                }
+            }
+            size[i] = total;
+            if (parent[i] === -1) cut[i] = 1;
+        }
+
+        // A packet has to start with a real rect: an invisible bridge left at the top of a piece
+        // is dropped, and the rect behind it starts the packet instead
+        const skip = new Uint8Array(n);
+        for (let i = 0; i < n; i++) {
+            if (!cut[i] || !rects[i].bridge) continue;
+            skip[i] = 1;
+            cut[i] = 0;
+            for (const k of children[i]) cut[k] = 1;
+        }
+
+        // Emit every packet in preorder, so each parent precedes its children
+        const chunks = [];
+        const localIndex = new Int32Array(n);
+        let strokeId = startStrokeId;
+        for (let root = 0; root < n; root++) {
+            if (!cut[root]) continue;
+            const chunkRects = [];
+            const stack = [root];
+            while (stack.length > 0) {
+                const i = stack.pop();
+                localIndex[i] = chunkRects.length;
+                const rect = rects[i];
+                chunkRects.push({
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                    parentIndex: i === root ? 0 : localIndex[parent[i]] * 5,
+                    bridge: !!rect.bridge
+                });
+                for (const k of children[i]) {
+                    if (!cut[k] && !skip[k]) stack.push(k);
+                }
+            }
+            const res = buildFillBatchFrame(strokeId, hexColor, chunkRects);
+            chunks.push({ frame: res ? res.frame : null, strokeId, rectCount: chunkRects.length, rects: chunkRects });
+            strokeId++;
         }
 
         return chunks;
     }
 
+    // Islands that reach the trunk only through islands linked in the same pass wait for the next one
+    const TURN_PASSES = 4;
+
+    // Grid cells crossed by bridges, one map shared by all colors of a plan (it may be larger than
+    // asked: every color works in its own bounding box); cleared on every use
+    let bridgeCellMap = null;
+    function getBridgeCellMap(size) {
+        if (!bridgeCellMap || bridgeCellMap.length < size) bridgeCellMap = new Uint8Array(size);
+        return bridgeCellMap.fill(0, 0, size);
+    }
+
+    // Joins the separate islands (rect trees) of one color into one tree with invisible bridges:
+    // zero-height or zero-width segments that paint nothing. The game accepts a packet as long as
+    // every element touches its parent end-on, strictly inside the touched side, and nothing
+    // overlaps (all checked in a live game; a contact exactly on a corner is rejected), so one packet
+    // can carry many islands.
+    //   1. Straight bridges between neighbouring rects in the same grid row or column.
+    //   2. Γ-shaped bridges for islands that share no line with the rest (see linkWithTurn).
+    // Islands left without any path stay separate trees. Returns all nodes, parents before
+    // children; bridge nodes carry canvas coordinates. toCanvasX/Y map grid lines to canvas
+    // pixels exactly like the rect edges are mapped.
+    //
+    // Works in the color's bounding box: every bridge it builds (straight or Γ-shaped) lies inside
+    // it, and with 256 colors most colors cover a small part of the grid. Rect coordinates are
+    // shifted into the box for the call and shifted back afterwards; canvas mapping stays global.
+    function linkIslandsWithInvisibleBridges(rects, width, height, toCanvasX, toCanvasY) {
+        let minX = width;
+        let minY = height;
+        let maxX = 0;
+        let maxY = 0;
+        for (const r of rects) {
+            if (r.x < minX) minX = r.x;
+            if (r.y < minY) minY = r.y;
+            if (r.x + r.w > maxX) maxX = r.x + r.w;
+            if (r.y + r.h > maxY) maxY = r.y + r.h;
+        }
+        for (const r of rects) {
+            r.x -= minX;
+            r.y -= minY;
+        }
+        try {
+            return linkIslandsInBox(rects, maxX - minX, maxY - minY,
+                gx => toCanvasX(gx + minX), gy => toCanvasY(gy + minY));
+        } finally {
+            for (const r of rects) {
+                r.x += minX;
+                r.y += minY;
+            }
+        }
+    }
+
+    function linkIslandsInBox(rects, width, height, toCanvasX, toCanvasY) {
+        const n = rects.length;
+        const indexOf = new Map();
+        rects.forEach((r, i) => indexOf.set(r, i));
+        const uf = new Int32Array(n);
+        for (let i = 0; i < n; i++) uf[i] = i;
+        const find = (i) => {
+            while (uf[i] !== i) {
+                uf[i] = uf[uf[i]];
+                i = uf[i];
+            }
+            return i;
+        };
+
+        // Node graph: rects first, bridges appended; island trees give the initial edges
+        const nodes = rects.slice();
+        const adjacency = Array.from({ length: n }, () => []);
+        let components = n;
+        for (let i = 0; i < n; i++) {
+            const p = rects[i].parentRef ? indexOf.get(rects[i].parentRef) : undefined;
+            if (p === undefined) continue;
+            adjacency[i].push(p);
+            adjacency[p].push(i);
+            const a = find(i);
+            const b = find(p);
+            if (a !== b) {
+                uf[a] = b;
+                components--;
+            }
+        }
+
+        // Grid cells some bridge already runs through: a Γ-bridge keeps out of them, so bridges
+        // never run along or across each other (not something the game was tested with)
+        const bridgeCells = getBridgeCellMap(width * height);
+        const markRun = (fromX, fromY, toX, toY) => {
+            for (let y = Math.min(fromY, toY); y <= Math.max(fromY, toY); y++) {
+                for (let x = Math.min(fromX, toX); x <= Math.max(fromX, toX); x++) bridgeCells[y * width + x] = 1;
+            }
+        };
+
+        // Connects rect a to rect b through a chain of bridge segments (canvas coordinates)
+        const addChain = (a, segments, b) => {
+            let prev = a;
+            for (const seg of segments) {
+                const idx = nodes.length;
+                nodes.push({ x: seg.x, y: seg.y, w: seg.w, h: seg.h, bridge: true, parentRef: null });
+                adjacency.push([prev]);
+                adjacency[prev].push(idx);
+                prev = idx;
+            }
+            adjacency[prev].push(b);
+            adjacency[b].push(prev);
+            uf[find(a)] = find(b);
+            components--;
+        };
+
+        // A bridge runs strictly inside the pixel span of its grid line. Every rect edge sits on a
+        // line boundary, so there it touches nothing but the rects it connects. On a boundary it
+        // would run along the edge of a rect of the neighbouring line, which the game is not known
+        // to accept (parts went missing at 1x). Lines only 1 px wide get no bridge (null).
+        const interior = (toCanvas, line) => {
+            const start = toCanvas(line);
+            return toCanvas(line + 1) - start >= 2 ? start + 1 : null;
+        };
+
+        // 1. Neighbouring rects along one grid line are never separated by another rect of this
+        // color on that line, so a bridge between them crosses nothing of this packet
+        const linkAlong = (lines, isRow) => {
+            for (let line = 0; line < lines.length && components > 1; line++) {
+                const list = lines[line];
+                if (list.length < 2) continue;
+                list.sort(isRow ? (a, b) => rects[a].x - rects[b].x : (a, b) => rects[a].y - rects[b].y);
+                for (let k = 1; k < list.length; k++) {
+                    const a = list[k - 1];
+                    const b = list[k];
+                    if (find(a) === find(b)) continue;
+                    const at = interior(isRow ? toCanvasY : toCanvasX, line);
+                    if (at === null) continue;
+                    const first = rects[a];
+                    const second = rects[b];
+                    // Column bridges must not cross the row bridges laid before them
+                    if (!isRow) {
+                        let crossed = false;
+                        for (let y = first.y + first.h; y < second.y && !crossed; y++) crossed = bridgeCells[y * width + line] === 1;
+                        if (crossed) continue;
+                    }
+                    if (isRow) {
+                        const x1 = toCanvasX(first.x + first.w);
+                        addChain(a, [{ x: x1, y: at, w: toCanvasX(second.x) - x1, h: 0 }], b);
+                        markRun(first.x + first.w, line, second.x - 1, line);
+                    } else {
+                        const y1 = toCanvasY(first.y + first.h);
+                        addChain(a, [{ x: at, y: y1, w: 0, h: toCanvasY(second.y) - y1 }], b);
+                        markRun(line, first.y + first.h, line, second.y - 1);
+                    }
+                }
+            }
+        };
+
+        let rows = null;
+        let cols = null;
+        if (components > 1) {
+            rows = Array.from({ length: height }, () => []);
+            for (let i = 0; i < n; i++) {
+                const r = rects[i];
+                for (let y = r.y; y < r.y + r.h; y++) rows[y].push(i);
+            }
+            linkAlong(rows, true);
+        }
+        if (components > 1) {
+            cols = Array.from({ length: width }, () => []);
+            for (let i = 0; i < n; i++) {
+                const r = rects[i];
+                for (let x = r.x; x < r.x + r.w; x++) cols[x].push(i);
+            }
+            linkAlong(cols, false);
+        }
+
+        // The largest part is the trunk: everything else gets attached to it
+        let trunk = 0;
+        if (components > 1) {
+            const sizes = new Map();
+            let best = 0;
+            for (let i = 0; i < n; i++) {
+                const r = find(i);
+                const s = (sizes.get(r) || 0) + 1;
+                sizes.set(r, s);
+                if (s > best) {
+                    best = s;
+                    trunk = i;
+                }
+            }
+        }
+
+        // 2. Γ-shaped bridges. From island rect a the path runs along one of a's grid lines through
+        // empty cells to a turn, then across through empty cells to the first rect there; it is
+        // used when that rect b belongs to the trunk. In the tree the order is
+        // b → second leg → first leg → a (a's island has no other way in), and every child must
+        // touch its parent end-on: the second leg runs on past the turn, the first leg ends on it.
+        // The path is tried along a row first, then (for lines 1 px tall) along a column.
+        if (components > 1) {
+            // rows[y] / cols[x] hold the rects on each grid line, sorted along it (both complete
+            // here: they were built and sorted above, or components would already be 1). The first
+            // leg runs between two neighbours on a line and the second ends at the nearest rect on
+            // a crossing line, found by binary search, so no rect lies on either leg; only earlier
+            // bridges are checked cell by cell. No grid-sized tables per color.
+            const bridgeFree = (x, y) => x >= 0 && x < width && y >= 0 && y < height && bridgeCells[y * width + x] === 0;
+
+            // Written for "along a row, then down/up a column"; `transposed` swaps x and y
+            // throughout, which turns it into "along a column, then along a row"
+            const linkWithTurn = (members, transposed) => {
+                const T = transposed;
+                const rectOf = i => (T ? { x: rects[i].y, y: rects[i].x, w: rects[i].h, h: rects[i].w } : rects[i]);
+                const lineRects = T ? cols : rows;    // rects on each first-leg line, sorted by x
+                const crossRects = T ? rows : cols;   // rects on each second-leg line, sorted by y
+                const isFree = T ? (x, y) => bridgeFree(y, x) : bridgeFree;
+                const canvasX = T ? toCanvasY : toCanvasX;
+                const canvasY = T ? toCanvasX : toCanvasY;
+                const lineCount = T ? width : height;
+                const lineLength = T ? height : width;
+                const flip = s => (T ? { x: s.y, y: s.x, w: s.h, h: s.w } : s);
+                const mark = (x1, y1, x2, y2) => (T ? markRun(y1, x1, y2, x2) : markRun(x1, y1, x2, y2));
+                // Position in `list` of the first rect starting after line `pos`
+                const firstAfter = (list, pos) => {
+                    let lo = 0;
+                    let hi = list.length;
+                    while (lo < hi) {
+                        const mid = (lo + hi) >> 1;
+                        if (rectOf(list[mid]).y > pos) hi = mid;
+                        else lo = mid + 1;
+                    }
+                    return lo;
+                };
+
+                for (const a of members) {
+                    const A = rectOf(a);
+                    for (let r = A.y; r < A.y + A.h; r++) {
+                        const rowStart = canvasY(r);
+                        const rowSpan = canvasY(r + 1) - rowStart;
+                        if (rowSpan < 2) continue;
+                        const line = lineRects[r];
+                        const at = line.indexOf(a);
+                        for (const dir of [1, -1]) {
+                            // The free run reaches up to the next rect on this line, or the grid edge
+                            const neighbour = line[at + dir];
+                            const N = neighbour === undefined ? null : rectOf(neighbour);
+                            const runEnd = dir > 0 ? (N ? N.x - 1 : lineLength - 1) : (N ? N.x + N.w : 0);
+                            for (let c = dir > 0 ? A.x + A.w : A.x - 1; dir > 0 ? c <= runEnd : c >= runEnd; c += dir) {
+                                if (!isFree(c, r)) break;
+                                const xc = interior(canvasX, c);
+                                if (xc === null) continue;
+                                const cross = crossRects[c];
+                                const after = firstAfter(cross, r);
+                                for (const vdir of [1, -1]) {
+                                    // Nearest rect on line c past the turn: b covers line c from
+                                    // line k on (vdir > 0) or up to line k (vdir < 0)
+                                    const b = vdir > 0 ? cross[after] : cross[after - 1];
+                                    if (b === undefined || find(b) !== find(trunk)) continue;
+                                    const B = rectOf(b);
+                                    const k = vdir > 0 ? B.y : B.y + B.h - 1;
+                                    // The second leg must not cross earlier bridges on its way
+                                    let blocked = false;
+                                    for (let m = r + vdir; m !== k && !blocked; m += vdir) blocked = !isFree(c, m);
+                                    if (blocked) continue;
+                                    // The first leg runs at y; the second goes on to `beyond`, past
+                                    // the turn on the side away from b. In a 2 px line that end lands
+                                    // on the line boundary, so the cell there must be empty.
+                                    let y;
+                                    let beyond;
+                                    if (rowSpan >= 3) {
+                                        y = vdir > 0 ? rowStart + 2 : rowStart + 1;
+                                        beyond = vdir > 0 ? rowStart + 1 : rowStart + 2;
+                                    } else {
+                                        const side = r - vdir;
+                                        if (side >= 0 && side < lineCount) {
+                                            const before = vdir > 0 ? cross[after - 1] : cross[after];
+                                            const sideTaken = before !== undefined &&
+                                                (vdir > 0 ? rectOf(before).y + rectOf(before).h - 1 === side : rectOf(before).y === side);
+                                            if (sideTaken || !isFree(c, side)) continue;
+                                        }
+                                        y = rowStart + 1;
+                                        beyond = vdir > 0 ? rowStart : rowStart + 2;
+                                    }
+                                    const second = vdir > 0
+                                        ? { x: xc, y: beyond, w: 0, h: canvasY(k) - beyond }
+                                        : { x: xc, y: canvasY(k + 1), w: 0, h: beyond - canvasY(k + 1) };
+                                    const aSide = dir > 0 ? canvasX(A.x + A.w) : canvasX(A.x);
+                                    const first = dir > 0
+                                        ? { x: aSide, y, w: xc - aSide, h: 0 }
+                                        : { x: xc, y, w: aSide - xc, h: 0 };
+                                    mark(dir > 0 ? A.x + A.w : A.x - 1, r, c, r);
+                                    mark(c, r - vdir, c, k - vdir);
+                                    return { a, b, segments: [flip(second), flip(first)] };
+                                }
+                            }
+                        }
+                    }
+                }
+                return null;
+            };
+
+            // Islands that reach the trunk only through another island get their turn in a later
+            // pass; a few passes catch nearly all of them
+            for (let pass = 0; pass < TURN_PASSES && components > 1; pass++) {
+                const groups = new Map();
+                for (let i = 0; i < n; i++) {
+                    const r = find(i);
+                    if (r === find(trunk)) continue;
+                    if (!groups.has(r)) groups.set(r, []);
+                    groups.get(r).push(i);
+                }
+                let linked = 0;
+                for (const members of groups.values()) {
+                    if (find(members[0]) === find(trunk)) continue;
+                    const link = linkWithTurn(members, false) || linkWithTurn(members, true);
+                    if (!link) continue;
+                    addChain(link.b, link.segments, link.a);
+                    linked++;
+                }
+                if (!linked) break;
+            }
+        }
+
+        // Re-root everything as BFS trees from real rects, the trunk first, so parents always
+        // come first and every Γ-bridge is entered from its trunk side
+        const visited = new Uint8Array(nodes.length);
+        const ordered = [];
+        const queue = new Int32Array(nodes.length);
+        const starts = [trunk];
+        for (let i = 0; i < n; i++) starts.push(i);
+        for (const start of starts) {
+            if (visited[start]) continue;
+            visited[start] = 1;
+            nodes[start].parentRef = null;
+            let head = 0;
+            let tail = 0;
+            queue[tail++] = start;
+            while (head < tail) {
+                const cur = queue[head++];
+                ordered.push(nodes[cur]);
+                for (const nb of adjacency[cur]) {
+                    if (visited[nb]) continue;
+                    visited[nb] = 1;
+                    nodes[nb].parentRef = nodes[cur];
+                    queue[tail++] = nb;
+                }
+            }
+        }
+        return ordered;
+    }
+
     // Grid-based version: optimized with numeric keys + DFS + area-maximizing rects
-    function generateFillBatchesFromGrid(colorGrid, width, height, hexColor, startStrokeId, step, scaleX, scaleY, canvas, maxRectsPerChunk) {
+    // cellX/cellY: canvas pixels per grid cell
+    function generateFillBatchesFromGrid(colorGrid, width, height, hexColor, startStrokeId, cellX, cellY, canvas, maxRectsPerChunk, invisibleBridges) {
         const t0 = performance.now();
 
         // colorGrid is already a flat Uint8Array, so just duplicate it
@@ -1159,22 +1522,30 @@
 
         if (pixelCount === 0) return { frames: [], nextStrokeId: startStrokeId };
 
-        const initialPixelCount = pixelCount;
-
         // Generate rectangles with parent tree (DFS, flat array keys, optimized rect finding)
-        const rects = buildRectangleTreeDFS(pixelSet, pixelCount, width, height);
-        if (rects.length === 0) return { frames: [], nextStrokeId: startStrokeId };
+        const islandRects = buildRectangleTreeDFS(pixelSet, pixelCount, width, height);
+        if (islandRects.length === 0) return { frames: [], nextStrokeId: startStrokeId };
+        const toCanvasX = gx => Math.round(gx * cellX);
+        const toCanvasY = gy => Math.round(gy * cellY);
+        const rects = invisibleBridges
+            ? linkIslandsWithInvisibleBridges(islandRects, width, height, toCanvasX, toCanvasY)
+            : islandRects;
 
         const t1 = performance.now();
         debugLog(`[DrawBot] Optimization: ${pixelCount} px → ${rects.length} rects in ${(t1 - t0).toFixed(1)}ms`);
 
-        // Map rects to canvas coordinates (preserve DFS order for parent chain)
+        // Map rects to canvas coordinates, keeping the order: parents come before children
         const canvasRects = [];
         for (const rect of rects) {
-            const sx1 = Math.round(rect.x * step * scaleX);
-            const sy1 = Math.round(rect.y * step * scaleY);
-            const sx2 = Math.round((rect.x + rect.w) * step * scaleX);
-            const sy2 = Math.round((rect.y + rect.h) * step * scaleY);
+            if (rect.bridge) {
+                // Bridges are already in canvas coordinates, built with the same rounding as rect edges
+                canvasRects.push({ x: rect.x, y: rect.y, w: rect.w, h: rect.h, bridge: true, originalRect: rect });
+                continue;
+            }
+            const sx1 = toCanvasX(rect.x);
+            const sy1 = toCanvasY(rect.y);
+            const sx2 = toCanvasX(rect.x + rect.w);
+            const sy2 = toCanvasY(rect.y + rect.h);
 
             const clampedRect = {
                 x: Math.max(0, Math.min(sx1, canvas.width - 1)),
@@ -1210,7 +1581,9 @@
 
         return {
             frames: frames,
-            nextStrokeId: startStrokeId + chunks.length
+            nextStrokeId: startStrokeId + chunks.length,
+            // Separate trees left after linking; more than one means the color is still in pieces
+            trees: rects.reduce((n, r) => n + (r.parentRef ? 0 : 1), 0)
         };
     }
 
@@ -1376,13 +1749,11 @@
         return sent;
     }
 
-    async function sendFillBatchPacket(frame, rectCount, delayMs) {
+    // Pacing is up to the caller, which waits out the interval before each send
+    async function sendFillBatchPacket(frame, rectCount) {
         if (!wsInstance || !frame || cancelFlag) return false;
-        const delay = (typeof delayMs === 'number' && delayMs >= 0) ? delayMs : CFG.packetDelay;
-        debugLog(`[DrawBot] Sent Tool 8 packet (rects: ${rectCount}, length: ${frame.length}, delay: ${delay}ms)`);
-        const sent = await safeSendWithRetry(frame);
-        await sleep(delay);
-        return sent;
+        debugLog(`[DrawBot] Sent Tool 8 packet (rects: ${rectCount}, length: ${frame.length})`);
+        return safeSendWithRetry(frame);
     }
 
     async function sendStrokePackets(strokeId, hexColor, points, thickness) {
@@ -1421,11 +1792,37 @@
     }
 
     // --- Image Preprocessing & Analysis ---
+    // Grid the picture is drawn on, for a scale and the game canvas: its size in cells, the
+    // canvas pixels per cell (cellX/cellY) and the 768×448 layout units per cell (unitX/unitY).
+    // Normally the grid is 768/scale × 448/scale. At 1x on the game canvas (about 1516×848) that
+    // makes cells 1.9-2 px, and rounding turns every ~10th row and ~30th column into 1 px. An
+    // invisible bridge has to touch a side strictly inside it, which a 1 px side does not allow,
+    // so islands there stayed unlinked (about twice the packets). When cells would be under 2 px,
+    // the grid is half the canvas instead, with cells of exactly 2×2 px: 1-5% fewer cells, not
+    // visible, and every color fits in one packet again. `fineGrid` is false for the modes without
+    // invisible bridges, which keep the 768/scale grid.
+    function gridFor(step, canvas, fineGrid) {
+        const cellX = step * canvas.width / 768;
+        const cellY = step * canvas.height / 448;
+        if (!fineGrid || Math.min(cellX, cellY) >= 2) {
+            return { width: Math.round(768 / step), height: Math.round(448 / step), cellX, cellY, unitX: step, unitY: step };
+        }
+        return {
+            width: Math.floor(canvas.width / 2),
+            height: Math.floor(canvas.height / 2),
+            cellX: 2,
+            cellY: 2,
+            unitX: 1536 / canvas.width,
+            unitY: 896 / canvas.height
+        };
+    }
+
     // Returns the image as a flat grid of color indices (-1 = transparent) plus the list of
     // distinct hex colors those indices point to. Every color in the list occurs in the grid.
-    function processImage(img, step, colorsMode, denoiseLevel) {
-        const w = Math.round(768 / step);
-        const h = Math.round(448 / step);
+    function processImage(img, grid, colorsMode, denoiseLevel) {
+        const w = grid.width;
+        const h = grid.height;
+        const { unitX, unitY } = grid;
 
         const tempCanvas = document.createElement('canvas');
         tempCanvas.width = w;
@@ -1436,25 +1833,20 @@
         if (layoutMode === 'stretch') {
             ctx.drawImage(img, 0, 0, w, h);
         } else if (layoutMode === 'center') {
+            // Placed in 768×448 layout units, then converted to cells
             const imgRatio = img.width / img.height;
             const canvasRatio = 768 / 448;
-            let dw, dh, dx, dy;
+            let dw, dh;
             if (imgRatio > canvasRatio) {
-                dw = w;
-                dh = w / imgRatio;
+                dw = 768;
+                dh = 768 / imgRatio;
             } else {
-                dh = h;
-                dw = h * imgRatio;
+                dh = 448;
+                dw = 448 * imgRatio;
             }
-            dx = (w - dw) / 2;
-            dy = (h - dh) / 2;
-            ctx.drawImage(img, dx, dy, dw, dh);
+            ctx.drawImage(img, (768 - dw) / 2 / unitX, (448 - dh) / 2 / unitY, dw / unitX, dh / unitY);
         } else if (layoutMode === 'custom') {
-            const cx = customX / step;
-            const cy = customY / step;
-            const cw = customW / step;
-            const ch = customH / step;
-            ctx.drawImage(img, cx, cy, cw, ch);
+            ctx.drawImage(img, customX / unitX, customY / unitY, customW / unitX, customH / unitY);
         }
 
         const imgData = ctx.getImageData(0, 0, w, h);
@@ -1495,6 +1887,13 @@
         const paletteHex = palette.map(c => rgbToHex(c.r, c.g, c.b));
         const whiteIdx = paletteHex.indexOf('#FFFFFF');
 
+        // Nearest palette entry per distinct color, so the search runs once per color, not per pixel.
+        // "No limit" keeps every color as is, so there it is a plain lookup.
+        const nearestByColor = new Map();
+        if (colorsMode === 'infinite') {
+            palette.forEach((c, i) => nearestByColor.set((c.r << 16) | (c.g << 8) | c.b, i));
+        }
+
         // Int32: "No limit" mode can have far more than 32767 palette entries
         const pixelIndices = new Int32Array(w * h);
         for (let y = 0; y < h; y++) {
@@ -1505,16 +1904,21 @@
                 if (a < 150) {
                     pixelIndices[rowOffset + x] = -1; // -1 represents transparent
                 } else {
-                    let r = data[idx]; let g = data[idx + 1]; let b = data[idx + 2];
-                    let closestIdx = 0;
-                    let minDist = Infinity;
-                    const p = { r, g, b };
-                    for (let i = 0; i < palette.length; i++) {
-                        const dist = getDistance(p, palette[i]);
-                        if (dist < minDist) {
-                            minDist = dist;
-                            closestIdx = i;
+                    const r = data[idx]; const g = data[idx + 1]; const b = data[idx + 2];
+                    const rgbInt = (r << 16) | (g << 8) | b;
+                    let closestIdx = nearestByColor.get(rgbInt);
+                    if (closestIdx === undefined) {
+                        closestIdx = 0;
+                        let minDist = Infinity;
+                        const p = { r, g, b };
+                        for (let i = 0; i < palette.length; i++) {
+                            const dist = getDistance(p, palette[i]);
+                            if (dist < minDist) {
+                                minDist = dist;
+                                closestIdx = i;
+                            }
                         }
+                        nearestByColor.set(rgbInt, closestIdx);
                     }
                     pixelIndices[rowOffset + x] = closestIdx;
                 }
@@ -1603,17 +2007,18 @@
             pixelIndices[i] = c;
         }
 
-        return { indices: pixelIndices, colors, width: w, height: h };
+        return { indices: pixelIndices, colors, width: w, height: h, cellX: grid.cellX, cellY: grid.cellY };
     }
 
     // Preview and drawing need the same processed image; recomputing it is the slowest step
     let processedCache = null;
-    function processImageCached(img, src, step, colorsMode, denoiseLevel) {
-        const key = [step, colorsMode, denoiseLevel, layoutMode, customX, customY, customW, customH].join('|');
+    function processImageCached(img, src, grid, colorsMode, denoiseLevel) {
+        const key = [grid.width, grid.height, grid.cellX, grid.cellY, colorsMode, denoiseLevel,
+            layoutMode, customX, customY, customW, customH].join('|');
         if (processedCache && processedCache.src === src && processedCache.key === key) {
             return processedCache.result;
         }
-        const result = processImage(img, step, colorsMode, denoiseLevel);
+        const result = processImage(img, grid, colorsMode, denoiseLevel);
         processedCache = { src, key, result };
         return result;
     }
@@ -1644,13 +2049,13 @@
     }
 
     // Standard Lines mode: rectangles first, then the leftover pixels as straight lines or paths
-    function buildLineCommands(mask, width, height, step, scaleX, scaleY) {
+    function buildLineCommands(mask, width, height, cellX, cellY) {
         const toCanvasRect = (x, y, w, h) => ({
             kind: 'rect',
-            x1: Math.round(x * step * scaleX),
-            y1: Math.round(y * step * scaleY),
-            x2: Math.round((x + w) * step * scaleX),
-            y2: Math.round((y + h) * step * scaleY)
+            x1: Math.round(x * cellX),
+            y1: Math.round(y * cellY),
+            x2: Math.round((x + w) * cellX),
+            y2: Math.round((y + h) * cellY)
         });
 
         const commands = [];
@@ -1674,13 +2079,212 @@
                 commands.push(toCanvasRect(first.x, minY, 1, Math.max(...ys) - minY + 1));
             } else {
                 const points = simplifyPath(path.map(p => ({
-                    x: Math.round((p.x * step + step / 2) * scaleX),
-                    y: Math.round((p.y * step + step / 2) * scaleY)
+                    x: Math.round((p.x + 0.5) * cellX),
+                    y: Math.round((p.y + 0.5) * cellY)
                 })));
                 commands.push({ kind: 'path', points });
             }
         }
         return commands;
+    }
+
+    // --- Fill masks and draw order ---
+
+    // Most fragmented colors first: the fallback order when the order search is too expensive
+    function sortByIslands(processed, order) {
+        const { indices, width, height } = processed;
+        const islands = new Map();
+        for (const c of order) {
+            islands.set(c, countIslands(buildColorMask(indices, c), width, height));
+        }
+        return order.slice().sort((a, b) => islands.get(b) - islands.get(a));
+    }
+
+    // Returns countRegions(c, above): the number of regions of (pixels of color c) ∪ (pixels of
+    // colors with above[color] === 1) that contain c. Smart Bridges can join c's islands across any
+    // color drawn after it, so this is how many islands c still has when drawn before those colors.
+    function makeRegionCounter(indices, width) {
+        const total = indices.length;
+        const queue = new Int32Array(total);
+        const stamp = new Int32Array(total); // visited marker, no clearing between calls
+        let stampId = 0;
+
+        return function countRegions(c, above) {
+            stampId++;
+            let regions = 0;
+            for (let start = 0; start < total; start++) {
+                if (indices[start] !== c || stamp[start] === stampId) continue;
+                regions++;
+                let head = 0;
+                let tail = 0;
+                queue[tail++] = start;
+                stamp[start] = stampId;
+                while (head < tail) {
+                    const k = queue[head++];
+                    const x = k % width;
+                    for (let d = 0; d < 4; d++) {
+                        let nk;
+                        if (d === 0) { if (x === 0) continue; nk = k - 1; }
+                        else if (d === 1) { if (x === width - 1) continue; nk = k + 1; }
+                        else if (d === 2) { nk = k - width; if (nk < 0) continue; }
+                        else { nk = k + width; if (nk >= total) continue; }
+                        if (stamp[nk] === stampId) continue;
+                        const ci = indices[nk];
+                        if (ci === c || (ci >= 0 && above[ci] === 1)) {
+                            stamp[nk] = stampId;
+                            queue[tail++] = nk;
+                        }
+                    }
+                }
+            }
+            return regions;
+        };
+    }
+
+    // Pixel visits allowed for the draw order search (about a second); larger
+    // images with many colors fall back to the island-count order
+    const ORDER_SEARCH_BUDGET = 1.2e8;
+
+    // Picks the draw order top-down: the last color is the one that forms the fewest regions
+    // on its own, the one before it the fewest regions together with it, and so on.
+    // A color's packet count is roughly its region count, so this greedily minimizes packets.
+    function chooseDrawOrder(processed, order) {
+        const { indices, colors, width } = processed;
+        const n = order.length;
+        if (n * n / 2 * indices.length > ORDER_SEARCH_BUDGET) return null;
+
+        const pixelCounts = new Int32Array(colors.length);
+        for (let i = 0; i < indices.length; i++) {
+            if (indices[i] >= 0) pixelCounts[indices[i]]++;
+        }
+
+        const countRegions = makeRegionCounter(indices, width);
+        const above = new Uint8Array(colors.length);
+        const remaining = order.slice();
+        const topDown = [];
+        while (remaining.length > 0) {
+            let bestI = 0;
+            let bestCost = Infinity;
+            if (remaining.length > 1) {
+                for (let i = 0; i < remaining.length; i++) {
+                    const c = remaining[i];
+                    const cost = countRegions(c, above);
+                    // On a tie the larger color goes later: it gives the colors before it more area to bridge through
+                    if (cost < bestCost || (cost === bestCost && pixelCounts[c] > pixelCounts[remaining[bestI]])) {
+                        bestCost = cost;
+                        bestI = i;
+                    }
+                }
+            }
+            const chosen = remaining.splice(bestI, 1)[0];
+            topDown.push(chosen);
+            above[chosen] = 1;
+        }
+        // Greedy only: refining the order with a local search cost 0.5 s and saved at most one
+        // packet, since Smart Bridges only handle the colors Invisible bridges leave in pieces
+        return topDown.reverse();
+    }
+
+    // Pixel visits for one evaluation of a full draw order (colors × grid cells). Above it the order
+    // is searched on a coarser copy of the grid and then applied at full resolution: the order is a
+    // property of the picture as a whole, and this keeps the greedy search fast at 1x. Smaller
+    // grids are searched as is, where full detail gives a better order.
+    const ORDER_SEARCH_WORK = 2e6;
+    function downsampleForOrderSearch(processed, colorCount) {
+        const { indices, colors, width, height } = processed;
+        const factor = Math.ceil(Math.sqrt(colorCount * indices.length / ORDER_SEARCH_WORK));
+        if (factor <= 1) return processed;
+        const w = Math.ceil(width / factor);
+        const h = Math.ceil(height / factor);
+        const sampled = new Int32Array(w * h);
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                sampled[y * w + x] = indices[(y * factor) * width + x * factor];
+            }
+        }
+        // Colors missing from the sample form no regions there, so the search puts them on top
+        return { indices: sampled, colors, width: w, height: h };
+    }
+
+    // Preview and drawing build the same plan; the order search is the slow part, so keep it
+    const drawOrderCache = new WeakMap();
+
+    function getDrawOrder(processed, order, bgIdx) {
+        let byBackground = drawOrderCache.get(processed);
+        if (!byBackground) {
+            byBackground = new Map();
+            drawOrderCache.set(processed, byBackground);
+        }
+        let drawOrder = byBackground.get(bgIdx);
+        if (!drawOrder) {
+            const t0 = performance.now();
+            drawOrder = chooseDrawOrder(downsampleForOrderSearch(processed, order.length), order) || sortByIslands(processed, order);
+            debugLog(`[DrawBot] Draw order for ${order.length} colors in ${(performance.now() - t0).toFixed(1)}ms`);
+            byBackground.set(bgIdx, drawOrder);
+        }
+        return drawOrder;
+    }
+
+    // Bounding box of every color, in one pass over the grid
+    function colorBoxes(indices, width, colorCount) {
+        const boxes = Array.from({ length: colorCount }, () => ({ minX: Infinity, minY: Infinity, maxX: -1, maxY: -1 }));
+        for (let i = 0; i < indices.length; i++) {
+            const c = indices[i];
+            if (c < 0) continue;
+            const x = i % width;
+            const y = (i - x) / width;
+            const box = boxes[c];
+            if (x < box.minX) box.minX = x;
+            if (x > box.maxX) box.maxX = x;
+            if (y < box.minY) box.minY = y;
+            if (y > box.maxY) box.maxY = y;
+        }
+        return boxes;
+    }
+
+    // Fill steps (one per color, with its packets) in draw order.
+    // Every color is first linked on its own: Invisible bridges usually make it a single tree, and
+    // then neither Smart Bridges nor the draw order matter. Only colors still left in pieces get
+    // Smart Bridges: they join all islands of the color with paths over pixels of colors drawn
+    // later, which needs the searched draw order. (Joining only the leftover pieces to the main
+    // tree is faster but left ~30% more packets at 1x.) At 2x and coarser Invisible bridges link
+    // everything, so neither runs there and planning takes a fraction of the time.
+    function buildFillSteps(processed, order, bgIdx, opts) {
+        const { indices, colors, width, height } = processed;
+        const { batchSize, useBridge, invisibleBridges, canvas } = opts;
+        const generate = (c, mask) => generateFillBatchesFromGrid(mask, width, height, colors[c], 1,
+            processed.cellX, processed.cellY, canvas, batchSize, invisibleBridges);
+
+        const results = new Map();
+        const inPieces = [];
+        for (const c of order) {
+            const result = generate(c, buildColorMask(indices, c));
+            results.set(c, result);
+            if (useBridge && result.trees > 1) inPieces.push(c);
+        }
+
+        let drawOrder = order;
+        if (inPieces.length > 0) {
+            drawOrder = getDrawOrder(processed, order, bgIdx);
+            const colorToOrder = new Int32Array(colors.length).fill(-1);
+            drawOrder.forEach((c, i) => { colorToOrder[c] = i; });
+            const colorIndexGrid = new Int32Array(indices.length);
+            for (let i = 0; i < indices.length; i++) {
+                colorIndexGrid[i] = indices[i] >= 0 ? colorToOrder[indices[i]] : -1;
+            }
+            const boxes = colorBoxes(indices, width, colors.length);
+            for (const c of inPieces) {
+                const mask = buildColorMask(indices, c);
+                applyBridging(mask, colorIndexGrid, width, height, colorToOrder[c], boxes[c]);
+                const bridged = generate(c, mask);
+                // Bridges usually save packets; keep the plain version when they do not
+                if (bridged.frames.length <= results.get(c).frames.length) results.set(c, bridged);
+            }
+        }
+
+        return drawOrder
+            .map(c => ({ hex: colors[c], frames: results.get(c).frames }))
+            .filter(s => s.frames.length > 0);
     }
 
     // Progress units of one line-mode command: a path is a start packet plus a move packet
@@ -1692,9 +2296,7 @@
     // the drawing loop sends it as is. In fill mode the frames already carry their stroke IDs.
     function buildDrawPlan(processed, opts) {
         const { indices, colors, width, height } = processed;
-        const { fillBg, drawMode, batchSize, useBridge, maxBridgeLength, step, canvas } = opts;
-        const scaleX = canvas.width / 768;
-        const scaleY = canvas.height / 448;
+        const { fillBg, drawMode } = opts;
         let strokeId = opts.startStrokeId;
 
         const bgIdx = fillBg ? findBackgroundColorIdx(indices, colors.length) : -1;
@@ -1715,39 +2317,22 @@
         let packetCount = 0;
         let totalCommands = background ? background.strokeIds.length : 0;
 
-        if (drawMode === 'fill') {
-            // Colors with many islands go first so later colors can bridge across them
-            const islands = new Map();
-            for (const c of order) {
-                islands.set(c, countIslands(buildColorMask(indices, c), width, height));
-            }
-            order.sort((a, b) => islands.get(b) - islands.get(a));
-
-            const orderHex = order.map(c => colors[c]);
-            const colorToOrder = new Int32Array(colors.length).fill(-1);
-            order.forEach((c, i) => { colorToOrder[c] = i; });
-            const colorIndexGrid = new Int32Array(indices.length);
-            for (let i = 0; i < indices.length; i++) {
-                colorIndexGrid[i] = indices[i] >= 0 ? colorToOrder[indices[i]] : -1;
-            }
-
-            for (const c of order) {
-                const hex = colors[c];
-                const mask = buildColorMask(indices, c);
-                if (useBridge) {
-                    applyBridging(mask, colorIndexGrid, width, height, hex, orderHex, maxBridgeLength);
-                }
-                const result = generateFillBatchesFromGrid(mask, width, height, hex, strokeId, step, scaleX, scaleY, canvas, batchSize);
-                strokeId = result.nextStrokeId;
-                if (result.frames.length === 0) continue;
-                steps.push({ hex, frames: result.frames });
-                packetCount += result.frames.length;
-                rectCount += result.frames.reduce((acc, f) => acc + f.rectCount, 0);
+        if (isFillMode(drawMode)) {
+            // Packets are built before the draw order is known, so stroke IDs are assigned here
+            for (const fillStep of buildFillSteps(processed, order, bgIdx, opts)) {
+                const frames = fillStep.frames.map(f => {
+                    const id = strokeId++;
+                    const res = buildFillBatchFrame(id, fillStep.hex, f.rects);
+                    return Object.assign({}, f, { frame: res ? res.frame : null, strokeId: id });
+                });
+                steps.push({ hex: fillStep.hex, frames });
+                packetCount += frames.length;
+                rectCount += frames.reduce((acc, f) => acc + f.rectCount, 0);
             }
             totalCommands += packetCount;
         } else {
             for (const c of order) {
-                const commands = buildLineCommands(buildColorMask(indices, c), width, height, step, scaleX, scaleY);
+                const commands = buildLineCommands(buildColorMask(indices, c), width, height, processed.cellX, processed.cellY);
                 if (commands.length === 0) continue;
                 steps.push({ hex: colors[c], commands });
                 for (const cmd of commands) {
@@ -1763,9 +2348,12 @@
     }
 
     // --- Draw options from the panel ---
-    const BATCH_SIZE_DEFAULT = 3000;
-    const BATCH_SIZE_MAX = 9000;
+    // Both sizes were accepted in a live game (12 000 rects ≈ 210 KB, 24 000 ≈ 440 KB)
+    const BATCH_SIZE_DEFAULT = 12000;
+    const BATCH_SIZE_MAX = 24000;
     const PREVIEW_DEBOUNCE_MS = 300;
+    // Faster sending gets packets dropped by the game server
+    const FILL_PPS_MAX = 8;
 
     function readDrawOptions() {
         const el = id => document.getElementById(id);
@@ -1773,22 +2361,72 @@
             const v = parseInt(el(id) ? el(id).value : '', 10);
             return isNaN(v) ? fallback : clampInt(v, min, max);
         };
+        const drawMode = el('db-draw-mode') ? el('db-draw-mode').value : 'fill';
         return {
             step: readInt('db-scale', 4, 1, 15),
             colorsMode: el('db-colors-mode') ? el('db-colors-mode').value : '8',
             denoiseLevel: readInt('db-denoise-level', 0, 0, 3),
             fillBg: el('db-fill-bg') ? el('db-fill-bg').checked : false,
-            drawMode: el('db-draw-mode') ? el('db-draw-mode').value : 'fill',
+            drawMode,
             batchSize: readInt('db-batch-size', BATCH_SIZE_DEFAULT, 1, BATCH_SIZE_MAX),
             useBridge: el('db-use-bridge') ? el('db-use-bridge').checked : false,
-            maxBridgeLength: readInt('db-bridge-len', 50, 1, 150),
             packetDelay: readInt('db-delay', 127, 0, 1000),
-            fillPPS: readInt('db-fill-pps', 8, 1, 30)
+            fillPPS: readInt('db-fill-pps', FILL_PPS_MAX, 1, FILL_PPS_MAX),
+            // "Fast Fill" links each color's islands with invisible bridges; "Fast Fill (old)" sends
+            // every island as its own packet, as before them (a fallback if the game ever rejects them)
+            invisibleBridges: drawMode === 'fill'
         };
     }
 
+    function isFillMode(drawMode) {
+        return drawMode === 'fill' || drawMode === 'fill_old';
+    }
+
+    // Minimum gap between fill packets: the base interval plus a 10 ms safety margin
+    // (8 packets/s gives 135 ms between packets)
+    const FILL_INTERVAL_MARGIN_MS = 10;
     function fillIntervalFor(pps) {
-        return Math.max(125, Math.ceil(1000 / pps)) + 2;
+        return Math.max(125, Math.ceil(1000 / pps)) + FILL_INTERVAL_MARGIN_MS;
+    }
+
+    // The preview's plan, reused by Start when nothing that shapes it has changed. Building it is
+    // the slow part (up to ~2 s at 1x); its frames only need fresh stroke IDs and the current round.
+    let cachedPlan = null;
+
+    function planKey(opts) {
+        return [opts.step, opts.colorsMode, opts.denoiseLevel, opts.fillBg, opts.drawMode,
+            opts.batchSize, opts.useBridge, opts.invisibleBridges].join('|');
+    }
+
+    function planFor(processed, opts, canvas, startStrokeId) {
+        const key = planKey(opts);
+        const reusable = cachedPlan && cachedPlan.processed === processed && cachedPlan.key === key &&
+            cachedPlan.width === canvas.width && cachedPlan.height === canvas.height;
+        if (!reusable) {
+            const plan = buildDrawPlan(processed, Object.assign({}, opts, { canvas, startStrokeId }));
+            cachedPlan = { processed, key, width: canvas.width, height: canvas.height, plan };
+            return plan;
+        }
+        return restampPlan(cachedPlan.plan, startStrokeId);
+    }
+
+    // Same plan with stroke IDs renumbered from startStrokeId, in the order buildDrawPlan assigns
+    // them, and fill frames re-serialized so they also carry the current round and socket prefix
+    function restampPlan(plan, startStrokeId) {
+        let strokeId = startStrokeId;
+        const background = plan.background
+            ? { hex: plan.background.hex, strokeIds: plan.background.strokeIds.map(() => strokeId++) }
+            : null;
+        const steps = plan.steps.map(step => {
+            if (!step.frames) return step;
+            const frames = step.frames.map(f => {
+                const id = strokeId++;
+                const res = buildFillBatchFrame(id, step.hex, f.rects);
+                return Object.assign({}, f, { frame: res ? res.frame : null, strokeId: id });
+            });
+            return Object.assign({}, step, { frames });
+        });
+        return Object.assign({}, plan, { background, steps, nextStrokeId: strokeId });
     }
 
     // Each call bumps the generation, so a slow older preview cannot overwrite a newer one
@@ -1804,13 +2442,10 @@
             if (generation !== previewGeneration) return;
             draftImg = img;
             const opts = readDrawOptions();
-            CFG.maxBridgeLength = opts.maxBridgeLength;
 
-            const processed = processImageCached(img, src, opts.step, opts.colorsMode, opts.denoiseLevel);
-            const plan = buildDrawPlan(processed, Object.assign({}, opts, {
-                canvas: getGameCanvas() || { width: 768, height: 448 },
-                startStrokeId: 1
-            }));
+            const planCanvas = planningCanvas();
+            const processed = processImageCached(img, src, gridFor(opts.step, planCanvas, opts.invisibleBridges), opts.colorsMode, opts.denoiseLevel);
+            const plan = planFor(processed, opts, planCanvas, 1);
 
             // Render Preview Canvas
             const pCanvas = document.getElementById('db-preview-canvas');
@@ -1834,7 +2469,7 @@
             pCtx.putImageData(pImgData, 0, 0);
             document.getElementById('db-preview-container').style.display = 'flex';
 
-            if (opts.drawMode === 'fill') {
+            if (isFillMode(opts.drawMode)) {
                 const fillInterval = fillIntervalFor(opts.fillPPS);
                 const estSec = Math.round((plan.packetCount * fillInterval) / 1000) + (plan.background ? 1 : 0);
                 infoEl.innerHTML = `Rects: <b>${plan.rectCount}</b> | Packets: <b>${plan.packetCount}</b><br>Speed: <b>${opts.fillPPS} pkt/s</b> (${fillInterval}ms) | ~<b>${estSec}s</b>`;
@@ -1940,9 +2575,6 @@
         try {
             const opts = readDrawOptions();
             CFG.packetDelay = opts.packetDelay;
-            CFG.fillPPS = opts.fillPPS;
-            CFG.useBridge = opts.useBridge;
-            CFG.maxBridgeLength = opts.maxBridgeLength;
             const fillInterval = fillIntervalFor(opts.fillPPS);
             const thickness = opts.step * 4 - 2;
 
@@ -1976,12 +2608,12 @@
             }
 
             updateStatus('Processing...', '#fbbf24');
-            const processed = processImageCached(img, currentImageSrc, opts.step, opts.colorsMode, opts.denoiseLevel);
-            const plan = buildDrawPlan(processed, Object.assign({}, opts, { canvas, startStrokeId: strokeId }));
+            const processed = processImageCached(img, currentImageSrc, gridFor(opts.step, canvas, opts.invisibleBridges), opts.colorsMode, opts.denoiseLevel);
+            const plan = planFor(processed, opts, canvas, strokeId);
             strokeId = plan.nextStrokeId;
 
             const totalCommands = plan.totalCommands || 1;
-            const currentDelay = (opts.drawMode === 'fill') ? fillInterval : CFG.packetDelay;
+            const currentDelay = isFillMode(opts.drawMode) ? fillInterval : CFG.packetDelay;
             let commandsSent = 0;
             let packetsSent = 0;
             let packetsFailed = 0;
@@ -2027,21 +2659,19 @@
             }
 
             // 2. Colors
-            let lastPacketTime = performance.now() - fillInterval;
+            let lastSendTime = -Infinity;
+            // Timer wake-ups come 10-15 ms late, which made sending ~10% slower than the estimate.
+            // The learned lateness is subtracted from the next sleep, and the last few ms are waited
+            // out exactly, so packets keep the interval on average and never go out early.
+            let timerLateness = 0;
             for (let i = 0; i < plan.steps.length; i++) {
                 if (cancelFlag) break;
                 const { hex, frames, commands } = plan.steps[i];
 
-                // Small delay before switching to new color to prevent packet spam
-                if (i > 0) {
-                    await sleep(125);
-                    if (cancelFlag) break;
-                }
-
                 const colorLabel = `Color ${i + 1}/${plan.steps.length} (${hex})`;
                 updateStatus(colorLabel, hex);
 
-                if (opts.drawMode === 'fill') {
+                if (isFillMode(opts.drawMode)) {
                     // --- Fast Fill Mode (Tool 8) ---
                     const fillSendStart = performance.now();
                     let fillSendCount = 0;
@@ -2049,9 +2679,18 @@
                         await checkPause();
                         if (cancelFlag) break;
 
-                        const sleepTime = Math.max(0, fillInterval - (performance.now() - lastPacketTime));
-                        const sent = await sendFillBatchPacket(frameObj.frame, frameObj.rectCount, sleepTime);
-                        lastPacketTime = performance.now();
+                        // Wait out the rest of the interval since the previous packet, then send
+                        const target = lastSendTime + fillInterval;
+                        const wait = target - performance.now() - timerLateness;
+                        if (wait > 0) {
+                            const wakeAt = performance.now() + wait;
+                            await sleep(wait);
+                            timerLateness = timerLateness * 0.7 + Math.max(0, performance.now() - wakeAt) * 0.3;
+                        }
+                        while (performance.now() < target) { /* a few ms at most */ }
+                        if (cancelFlag) break;
+                        const sent = await sendFillBatchPacket(frameObj.frame, frameObj.rectCount);
+                        lastSendTime = performance.now();
                         trackSend(sent);
 
                         if (sent) {
@@ -2144,7 +2783,6 @@
                 denoise: document.getElementById('db-denoise-level')?.value || '0',
                 fillBg: document.getElementById('db-fill-bg')?.checked ?? false,
                 useBridge: document.getElementById('db-use-bridge')?.checked ?? true,
-                bridgeLen: document.getElementById('db-bridge-len')?.value || '50',
                 layoutMode: layoutMode,
                 customX: customX,
                 customY: customY,
@@ -2240,7 +2878,7 @@
             <div id="db-header" style="cursor: move; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 8px; margin-bottom: 12px;">
                 <div style="font-weight: 800; color: #a78bfa; font-size: 14px; display: flex; align-items: center; gap: 6px;">
                     <span class="pulse-dot"></span>
-                    DrawBot 1.2
+                    DrawBot 2.0
                 </div>
                 <button id="db-minimize-btn" style="background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 12px; transition: color 0.2s;">➖</button>
             </div>
@@ -2301,13 +2939,14 @@
                     <div style="flex: 1; font-size: 11px;">
                         <label style="display: block; margin-bottom: 4px; color: #94a3b8;">Mode:</label>
                         <select id="db-draw-mode" style="width: 100%; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; cursor: pointer;">
-                            <option value="fill" selected>Fast Fill</option>
+                            <option value="fill" selected title="Links all spots of a color with invisible bridges: about one packet per color">Fast Fill</option>
+                            <option value="fill_old" title="Every separate spot is its own packet, as before invisible bridges. Slower; a fallback">Fast Fill (old)</option>
                             <option value="lines">Standard Lines</option>
                         </select>
                     </div>
                     <div id="db-batch-wrapper" style="flex: 1; font-size: 11px;">
                         <label style="display: block; margin-bottom: 4px; color: #94a3b8;">Rects per packet:</label>
-                        <input type="number" id="db-batch-size" min="1" max="9000" value="3000" style="width: 100%; box-sizing: border-box; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
+                        <input type="number" id="db-batch-size" min="1" max="24000" value="12000" style="width: 100%; box-sizing: border-box; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
                     </div>
                 </div>
 
@@ -2361,13 +3000,8 @@
                 </div>
 
                 <div id="db-fill-pps-wrapper" style="margin-bottom: 10px; font-size: 11px; display: flex; align-items: center; justify-content: space-between; background: rgba(167, 139, 250, 0.06); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 8px; padding: 8px;">
-                    <span style="color: #c4b5fd; font-weight: 600;">⚡ Packets/s (fill):</span>
-                    <input type="number" id="db-fill-pps" min="1" max="30" value="8" style="width: 60px; padding: 6px; background: #1e293b; color: #c4b5fd; border: 1px solid #7c3aed; border-radius: 8px; font-size: 11px; outline: none; text-align: center; font-weight: 800;">
-                </div>
-
-                <div id="db-bridge-len-wrapper" style="margin-bottom: 10px; font-size: 11px; display: flex; align-items: center; justify-content: space-between; background: rgba(167, 139, 250, 0.06); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 8px; padding: 8px;">
-                    <span style="color: #c4b5fd; font-weight: 600;">🌉 Bridge length (px):</span>
-                    <input type="number" id="db-bridge-len" min="1" max="150" value="50" style="width: 60px; padding: 6px; background: #1e293b; color: #c4b5fd; border: 1px solid #7c3aed; border-radius: 8px; font-size: 11px; outline: none; text-align: center; font-weight: 800;">
+                    <span style="color: #c4b5fd; font-weight: 600;">⚡ Packets/s (fill, max 8):</span>
+                    <input type="number" id="db-fill-pps" min="1" max="8" value="8" style="width: 60px; padding: 6px; background: #1e293b; color: #c4b5fd; border: 1px solid #7c3aed; border-radius: 8px; font-size: 11px; outline: none; text-align: center; font-weight: 800;">
                 </div>
 
                 <div style="display: flex; gap: 8px; margin-bottom: 12px;">
@@ -2384,7 +3018,7 @@
                         <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #94a3b8;">
                             <input type="checkbox" id="db-fill-bg" style="accent-color: #a78bfa;"> Fill background
                         </label>
-                        <label id="db-bridge-wrapper" style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #94a3b8;">
+                        <label id="db-bridge-wrapper" title="Joins islands of a color through areas painted over later and picks the best color order. Far fewer packets, same picture." style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #94a3b8;">
                             <input type="checkbox" id="db-use-bridge" checked style="accent-color: #a78bfa;"> Smart Bridges
                         </label>
                     </div>
@@ -2432,7 +3066,10 @@
             applySavedValue('db-denoise-level', savedSetting.denoise);
             applySavedValue('db-fill-bg', savedSetting.fillBg);
             applySavedValue('db-use-bridge', savedSetting.useBridge);
-            applySavedValue('db-bridge-len', savedSetting.bridgeLen);
+            // The "Invisible bridges" checkbox became the "Fast Fill (old)" mode
+            if (savedSetting.drawMode === 'fill' && savedSetting.invisibleBridges === false) {
+                applySavedValue('db-draw-mode', 'fill_old');
+            }
             if (['stretch', 'center', 'custom'].includes(savedSetting.layoutMode)) layoutMode = savedSetting.layoutMode;
             if (Number.isFinite(savedSetting.customX)) customX = savedSetting.customX;
             if (Number.isFinite(savedSetting.customY)) customY = savedSetting.customY;
@@ -2601,7 +3238,7 @@
             document.getElementById(id).addEventListener('change', handleTriggerUpdate);
         });
         // Number fields: their values are read and clamped by readDrawOptions()
-        ['db-batch-size', 'db-delay', 'db-fill-pps', 'db-bridge-len'].forEach(id => {
+        ['db-batch-size', 'db-delay', 'db-fill-pps'].forEach(id => {
             document.getElementById(id).addEventListener('input', handleTriggerUpdate);
         });
 
@@ -2611,19 +3248,14 @@
         const fillPPSWrapper = document.getElementById('db-fill-pps-wrapper');
         const delayWrapper = document.getElementById('db-delay-wrapper');
         const bridgeWrapper = document.getElementById('db-bridge-wrapper');
-        const bridgeLenWrapper = document.getElementById('db-bridge-len-wrapper');
-        const useBridgeCheckbox = document.getElementById('db-use-bridge');
         const updateFillPPSVisibility = () => {
-            const isFill = drawModeSelect.value === 'fill';
-            const useBridge = useBridgeCheckbox ? useBridgeCheckbox.checked : false;
+            const isFill = isFillMode(drawModeSelect.value);
             if (fillPPSWrapper) fillPPSWrapper.style.display = isFill ? 'flex' : 'none';
             if (delayWrapper) delayWrapper.style.display = isFill ? 'none' : 'flex';
             if (bridgeWrapper) bridgeWrapper.style.display = isFill ? 'flex' : 'none';
-            if (bridgeLenWrapper) bridgeLenWrapper.style.display = (isFill && useBridge) ? 'flex' : 'none';
             if (batchWrapper) batchWrapper.style.display = isFill ? 'block' : 'none';
         };
         drawModeSelect.addEventListener('change', updateFillPPSVisibility);
-        if (useBridgeCheckbox) useBridgeCheckbox.addEventListener('change', updateFillPPSVisibility);
         updateFillPPSVisibility();
 
         // Round (turn ID): auto-detected, can be overridden by hand
@@ -2733,6 +3365,18 @@
             cancelFlag = true;
             isPaused = false;
         });
+
+        // The game canvas appears only in the drawing round. When its size differs from what the
+        // preview planned for, redo the preview, so the estimate and the ready plan match what
+        // Start will send (otherwise Start rebuilds the plan, which takes up to ~2 s at 1x)
+        setInterval(() => {
+            const canvas = getGameCanvas();
+            if (!canvas || isDrawing || !currentImageSrc || layoutMode === 'custom') return;
+            if (cachedPlan && cachedPlan.width === canvas.width && cachedPlan.height === canvas.height) return;
+            rememberCanvasSize(canvas);
+            isApplied = false;
+            schedulePreview();
+        }, 1000);
 
         // Hook initial websocket check
         if (wsInstance) {
