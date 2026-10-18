@@ -2363,8 +2363,8 @@
         };
         const drawMode = el('db-draw-mode') ? el('db-draw-mode').value : 'fill';
         return {
-            step: readInt('db-scale', 4, 1, 15),
-            colorsMode: el('db-colors-mode') ? el('db-colors-mode').value : '8',
+            step: readInt('db-scale', 2, 1, 15),
+            colorsMode: el('db-colors-mode') ? el('db-colors-mode').value : '32',
             denoiseLevel: readInt('db-denoise-level', 0, 0, 3),
             fillBg: el('db-fill-bg') ? el('db-fill-bg').checked : false,
             drawMode,
@@ -2774,8 +2774,8 @@
     function saveSettings() {
         try {
             const settings = {
-                scale: document.getElementById('db-scale')?.value || '4',
-                colorsMode: document.getElementById('db-colors-mode')?.value || '8',
+                scale: document.getElementById('db-scale')?.value || '2',
+                colorsMode: document.getElementById('db-colors-mode')?.value || '32',
                 drawMode: document.getElementById('db-draw-mode')?.value || 'fill',
                 batchSize: document.getElementById('db-batch-size')?.value || String(BATCH_SIZE_DEFAULT),
                 delay: document.getElementById('db-delay')?.value || '127',
@@ -2902,9 +2902,9 @@
                         <label style="display: block; margin-bottom: 4px; color: #94a3b8;">Scale:</label>
                         <select id="db-scale" style="width: 100%; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; cursor: pointer;">
                             <option value="1">1x (HD)</option>
-                            <option value="2">2x (Detailed)</option>
+                            <option value="2" selected>2x (Detailed)</option>
                             <option value="3">3x (Recommended)</option>
-                            <option value="4" selected>4x (Sketch)</option>
+                            <option value="4">4x (Sketch)</option>
                             <option value="5">5x (Pixel Art)</option>
                             <option value="6">6x (Large)</option>
                             <option value="7">7x (Bold)</option>
@@ -2922,10 +2922,10 @@
                         <label style="display: block; margin-bottom: 4px; color: #94a3b8;">Colors:</label>
                         <select id="db-colors-mode" style="width: 100%; padding: 6px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; cursor: pointer;">
                                 <option value="gartic">Game palette (18)</option>
-                                <option value="8" selected>True Color (8)</option>
+                                <option value="8">True Color (8)</option>
                             <option value="16">True Color (16)</option>
                             <option value="24">True Color (24)</option>
-                            <option value="32">True Color (32)</option>
+                            <option value="32" selected>True Color (32)</option>
                             <option value="48">True Color (48)</option>
                             <option value="64">True Color (64)</option>
                             <option value="128">True Color (128)</option>
