@@ -14,17 +14,27 @@
 
 ## Table of Contents
 
+- [What's New in 2.1](#whats-new-in-21)
 - [What's New in 2.0](#whats-new-in-20)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Animations: GIF, WebP and Video](#animations-gif-webp-and-video)
 - [Settings Reference](#settings-reference)
 - [Drawing Modes](#drawing-modes)
 - [How Long Does It Take?](#how-long-does-it-take)
 - [Tips & Recommendations](#tips--recommendations)
 - [Troubleshooting](#troubleshooting)
 - [How It Works](#how-it-works)
+
+---
+
+## What's New in 2.1
+
+- 🎞 **GIFs, animated WebP/PNG and videos** — load an animation and the bot draws it frame by frame: frame 1 in round 1, frame 2 in round 2 and so on. Made for the game's **Animation** mode, see [Animations](#animations-gif-webp-and-video)
+- 🤖 **Auto-draw** — optionally starts drawing the next frame by itself when a new round begins
+- 📼 **All frames on one canvas** — draws the whole animation in a single round, frame over frame. The album replays drawings in the order they were drawn, so the replay plays the animation
 
 ---
 
@@ -42,6 +52,7 @@
 ## Features
 
 - 🖼 **Any image source** — a local file, an image URL, **Ctrl+V** from the clipboard, or drag & drop onto the panel
+- 🎞 **Animations** — GIF, animated WebP/PNG and video (MP4, WebM) are drawn frame by frame, one frame per round, with optional auto-draw
 - ⚡ **Fast Fill** — uses the game's own fill tool (Tool 8) and sends about one packet per color
 - 🎨 **Flexible colors** — the game palette (18 colors), True Color with 8–256 colors, or every color as is
 - 🌉 **Smart Bridges** — joins the remaining islands of a color through areas that are painted over later, and picks the color order that leaves the fewest islands
@@ -121,6 +132,33 @@ The image can be loaded before the drawing round, for example while the others a
 
 ---
 
+## Animations: GIF, WebP and Video
+
+Load a GIF, an animated WebP/PNG or a video (MP4, WebM) the same way as a picture: 📁, a link, or drag & drop. The **Animation** block appears under the image field:
+
+| Control | What it does |
+|---|---|
+| **Frame** | The frame that is shown in the preview and drawn on Start. Picking a frame by hand switches *Frame follows round* off |
+| **Frame follows round** | Round 1 draws frame 1, round 2 the next frame, and so on; after the last frame it starts over. On by default |
+| **Step** | How many frames to move on per round (or, with *All frames*, which frames to draw: every Step-th). With a 60-frame GIF and 10 rounds, Step 6 spreads the rounds over the whole animation |
+| **All frames on this canvas (album replay)** | Draws frames 1, 1+Step, 1+2·Step, … one over another on the current canvas (at most 200). The preview shows the total packets and time |
+| **Video frames per second** | Videos only: how many frames are taken from each second of the clip (1–30, default 5). A 10-second clip at 5 gives 50 frames |
+| **Auto-draw each new round** | Starts drawing by itself about 2 s after a new round begins, so you only have to click **Done**. Switched on during a drawing round, it starts with the next round. Off after every page reload |
+
+**All frames on one canvas.** The album shows a replay of how each drawing was made, so a drawing made of frames drawn one over another plays as an animation there, in any game mode. To keep it cheap:
+- all frames share one palette, so colors do not flicker between frames;
+- from frame 2 on only the cells that change are drawn, so a still background costs nothing after frame 1;
+- transparent parts are painted white, so they do not keep the previous frame.
+
+Each frame still takes about one packet per color that changes, so the round timer is the limit: 12 frames of a simple GIF at 32 colors take ~45 s. Use fewer colors, a larger Step or a coarser Scale for longer animations. How smoothly the album replays it is up to the game.
+
+Typical use in the game's **Animation** mode: load the GIF before the game starts, check that the **Round** field matches the game, turn on **Auto-draw**, and click **Done** after each frame.
+
+Frames of GIF/WebP/PNG are decoded with the browser's `ImageDecoder`, which Chrome, Edge and Opera have. In other browsers an animated image is drawn as a still picture (its first frame). Videos work in every browser that can play them.
+
+
+---
+
 ## Settings Reference
 
 | Setting | What it does | Default | Recommended |
@@ -184,6 +222,8 @@ Very large colors (over 12000 rectangles, usually at 1x) take an extra packet ea
 | The drawing is missing in the album | The round may be wrong: uncheck **Auto** next to **Round** and enter the round number shown by the game |
 | Parts of the drawing are missing | Switch to `Fast Fill (old)`. If that doesn't help, lower **Rects per packet** (try 1000) or **Packets/s** (try 6–7) |
 | `Could not load image` for a link | Many sites don't allow other pages to read their images. Download the image and load it with 📁, or copy it and press Ctrl+V |
+| A GIF loads as a still picture | Your browser has no `ImageDecoder` (e.g. Firefox). Use Chrome, Edge or Opera, or convert the animation to MP4/WebM |
+| A video from a link does not load | The site does not allow downloading it from another page. Download the video and load it with 📁 |
 | `⚠ … packets failed to send` | The connection was unstable; draw again on a new round or lower **Packets/s** |
 | Start waits a moment before sending | The plan is being made (up to ~2 s at 1x with many colors). Normally it is ready from the preview |
 
@@ -217,7 +257,8 @@ The script patches `WebSocket` and `WebSocket.prototype.send` at `document-start
    - *True Color (N)*: shades are merged into clusters by frequency; for images with over 4096 distinct colors near-identical shades are merged first. Free palette slots are then filled with the colors that are worst represented, followed by 3 K-Means passes
    - *No limit*: all colors are used as they are
 3. **Denoising** (optional) — lone pixels are repainted with their most common neighbour
-4. **Preview** — the processed grid is shown in the panel, together with the plan's numbers. Both the processed image and the plan are cached, so Start sends exactly what the preview showed
+4. **Animations** — a GIF/WebP/PNG is decoded frame by frame with `ImageDecoder`; a video is seeked to the middle of each frame's time slot and copied to a canvas. Only the selected frame is decoded (the last few are cached), and it then goes through the steps above like any picture
+5. **Preview** — the processed grid is shown in the panel, together with the plan's numbers. Both the processed image and the plan are cached, so Start sends exactly what the preview showed
 
 ### Drawing Engine
 
@@ -269,17 +310,27 @@ Every drawing packet looks like this:
 
 ## Содержание
 
+- [Что нового в 2.1](#что-нового-в-21)
 - [Что нового в 2.0](#что-нового-в-20)
 - [Возможности](#возможности)
 - [Требования](#требования)
 - [Установка](#установка)
 - [Использование](#использование)
+- [Анимации: GIF, WebP и видео](#анимации-gif-webp-и-видео)
 - [Описание настроек](#описание-настроек)
 - [Режимы рисования](#режимы-рисования)
 - [Сколько времени занимает рисование](#сколько-времени-занимает-рисование)
 - [Советы и рекомендации](#советы-и-рекомендации)
 - [Решение проблем](#решение-проблем)
 - [Как работает бот](#как-работает-бот)
+
+---
+
+## Что нового в 2.1
+
+- 🎞 **GIF, анимированные WebP/PNG и видео** — загрузите анимацию, и бот нарисует её по кадрам: кадр 1 в раунде 1, кадр 2 в раунде 2 и так далее. Сделано для режима игры **Анимация**, см. [Анимации](#анимации-gif-webp-и-видео)
+- 🤖 **Авторисование** — по желанию бот сам начинает рисовать следующий кадр, когда начинается новый раунд
+- 📼 **Все кадры на одном холсте** — рисует всю анимацию за один раунд, кадр поверх кадра. Альбом проигрывает рисунки в том порядке, в котором их рисовали, поэтому повтор показывает анимацию
 
 ---
 
@@ -297,6 +348,7 @@ Every drawing packet looks like this:
 ## Возможности
 
 - 🖼 **Любой источник картинки** — локальный файл, ссылка на изображение, **Ctrl+V** из буфера обмена или перетаскивание на панель
+- 🎞 **Анимации** — GIF, анимированные WebP/PNG и видео (MP4, WebM) рисуются по кадрам, по кадру за раунд, с возможностью авторисования
 - ⚡ **Fast Fill** — использует инструмент заливки самой игры (Tool 8) и отправляет примерно один пакет на цвет
 - 🎨 **Гибкая работа с цветами** — палитра игры (18 цветов), True Color на 8–256 цветов или все цвета как есть
 - 🌉 **Умные мосты** — соединяют оставшиеся островки цвета через области, которые позже закрасятся, и подбирают порядок цветов, при котором островков меньше всего
@@ -378,6 +430,33 @@ Tampermonkey сам проверяет обновления установлен
 
 ---
 
+## Анимации: GIF, WebP и видео
+
+GIF, анимированный WebP/PNG или видео (MP4, WebM) загружаются так же, как картинка: через 📁, ссылкой или перетаскиванием. Под полем для картинки появляется блок анимации:
+
+| Элемент | Что делает |
+|---|---|
+| **Frame** (кадр) | Кадр, который показан в превью и рисуется по Start. Если выбрать кадр вручную, *Frame follows round* выключится |
+| **Frame follows round** (кадр по раунду) | В раунде 1 рисуется кадр 1, в раунде 2 следующий и так далее; после последнего кадра всё начинается сначала. Включено по умолчанию |
+| **Step** (шаг) | На сколько кадров сдвигаться за раунд (а с *All frames* — какие кадры рисовать: каждый Step-й). Для GIF из 60 кадров и 10 раундов шаг 6 растянет раунды на всю анимацию |
+| **All frames on this canvas (album replay)** | Рисует кадры 1, 1+Step, 1+2·Step, … друг поверх друга на текущем холсте (не больше 200). Превью показывает общее число пакетов и время |
+| **Video frames per second** | Только для видео: сколько кадров брать из каждой секунды ролика (1–30, по умолчанию 5). Ролик на 10 секунд при 5 даёт 50 кадров |
+| **Auto-draw each new round** (авторисование) | Сам начинает рисовать примерно через 2 с после начала нового раунда, остаётся только нажимать **Готово**. Если включить во время раунда рисования, начнёт со следующего раунда. После перезагрузки страницы выключено |
+
+**Все кадры на одном холсте.** Альбом показывает повтор того, как рисовался каждый рисунок, поэтому рисунок из кадров, нарисованных друг поверх друга, проигрывается там как анимация, в любом режиме игры. Чтобы это было дёшево:
+- у всех кадров одна общая палитра, поэтому цвета не мерцают между кадрами;
+- начиная со второго кадра рисуются только клетки, которые изменились, поэтому неподвижный фон после первого кадра ничего не стоит;
+- прозрачные части закрашиваются белым, чтобы на них не оставался предыдущий кадр.
+
+Каждый кадр всё равно занимает примерно пакет на каждый изменившийся цвет, поэтому ограничение — таймер раунда: 12 кадров простой GIF на 32 цвета занимают ~45 с. Для длинных анимаций берите меньше цветов, больший Step или крупнее масштаб. Насколько плавно альбом это проиграет, зависит от игры.
+
+Как обычно пользоваться в режиме игры **Анимация**: загрузите GIF до начала игры, проверьте, что поле **Round** совпадает с раундом в игре, включите **Auto-draw** и нажимайте **Готово** после каждого кадра.
+
+Кадры GIF/WebP/PNG декодируются через браузерный `ImageDecoder`, который есть в Chrome, Edge и Opera. В других браузерах анимированная картинка рисуется как обычная (первый кадр). Видео работает в любом браузере, который умеет его воспроизводить.
+
+
+---
+
 ## Описание настроек
 
 | Настройка | Что делает | По умолчанию | Рекомендуется |
@@ -441,6 +520,8 @@ Tampermonkey сам проверяет обновления установлен
 | Рисунка нет в альбоме | Возможно, раунд определился неверно: снимите галочку **Auto** рядом с **Round** и введите номер раунда, который показывает игра |
 | Пропадают части рисунка | Переключитесь на `Fast Fill (old)`. Если не помогло, уменьшите **Rects per packet** (например, до 1000) или **Packets/s** (до 6–7) |
 | `Could not load image` для ссылки | Многие сайты не дают другим страницам читать свои картинки. Скачайте картинку и загрузите через 📁 или скопируйте её и нажмите Ctrl+V |
+| GIF загружается как обычная картинка | В браузере нет `ImageDecoder` (например, Firefox). Используйте Chrome, Edge или Opera или переведите анимацию в MP4/WebM |
+| Видео по ссылке не загружается | Сайт не разрешает скачивать его с других страниц. Скачайте видео и загрузите через 📁 |
 | `⚠ … packets failed to send` | Соединение было нестабильным; нарисуйте заново в следующем раунде или уменьшите **Packets/s** |
 | После Start бот немного ждёт перед отправкой | Строится план (до ~2 с на 1x с большим числом цветов). Обычно он уже готов после превью |
 
@@ -474,7 +555,8 @@ DrawBot — это UserScript для Tampermonkey, который работае
    - *True Color (N)*: оттенки объединяются в кластеры по частоте; если у картинки больше 4096 разных цветов, почти одинаковые оттенки сначала сливаются. Свободные места в палитре заполняются цветами, которые хуже всего представлены, после чего идут 3 прохода K-Means
    - *Без лимита*: все цвета используются как есть
 3. **Шумоподавление** (по желанию) — одиночные пиксели перекрашиваются в самый частый соседний цвет
-4. **Превью** — обработанная сетка показывается на панели вместе с цифрами плана. И обработанная картинка, и план кэшируются, поэтому Start отправляет ровно то, что показало превью
+4. **Анимации** — GIF/WebP/PNG декодируются по кадрам через `ImageDecoder`; видео перематывается на середину интервала каждого кадра, и кадр копируется на canvas. Декодируется только выбранный кадр (несколько последних кэшируются), дальше он проходит те же шаги, что и обычная картинка
+5. **Превью** — обработанная сетка показывается на панели вместе с цифрами плана. И обработанная картинка, и план кэшируются, поэтому Start отправляет ровно то, что показало превью
 
 ### Движок рисования
 

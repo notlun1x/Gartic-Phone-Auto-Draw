@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gartic Phone DrawBot
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Automated drawing bot with WebSocket interception, image loading, color quantization, preview and progress indicator
+// @version      2.1
+// @description  Automated drawing bot with WebSocket interception, image, GIF and video loading, color quantization, preview and progress indicator
 // @author       NotLun1x
 // @match        https://garticphone.com/*
 // @grant        none
@@ -150,11 +150,14 @@
 
     // Stroke IDs only have to be unique within a round, so a new round starts a fresh sequence.
     // Other socket events (chat, timers, state updates) no longer reset it mid-round.
+    // Set by the panel: picks the animation frame for the new round
+    let onRoundChanged = null;
     function applyTurnId(value) {
         if (value === CFG.currentTurnId) return;
         CFG.currentTurnId = value;
         strokeIdCounter = randomSafeStrokeStart();
         console.log(`[DrawBot] Round ${turnIdToRound(value)}: stroke IDs restart at ${strokeIdCounter}.`);
+        if (onRoundChanged) onRoundChanged();
     }
 
     // turnId is 0-based in packets, while the game counts rounds from 1
@@ -360,7 +363,8 @@
         ctx.lineWidth = 1;
         ctx.strokeRect(0, 0, w, h);
         
-        if (draftImg && draftImg.complete) {
+        // A video or GIF frame is a canvas, which has no `complete`
+        if (draftImg && draftImg.complete !== false) {
             const cx = customX / step;
             const cy = customY / step;
             const cw = customW / step;
@@ -692,7 +696,177 @@
         return centers;
     }
 
+    // --- Animations (GIF / WebP / APNG / video) ---
+    // An animated source is drawn one frame at a time. The selected frame stands in for the image:
+    // currentImageSrc holds a frame key, and loadImage() returns that frame as a canvas.
+    const FRAME_KEY_PREFIX = 'drawbot-frame:';
+    const FRAME_CACHE_SIZE = 6;
+    let animation = null; // { id, kind, frameCount, cache, queue, decoder | video, duration, fps }
+    let animationSeq = 0;
+
+    function frameKey(anim, index) {
+        return `${FRAME_KEY_PREFIX}${anim.id}:${index}`;
+    }
+
+    function parseFrameKey(src) {
+        if (typeof src !== 'string' || !src.startsWith(FRAME_KEY_PREFIX)) return null;
+        const [id, index] = src.slice(FRAME_KEY_PREFIX.length).split(':').map(Number);
+        return { id, index };
+    }
+
+    // Resolves on `event`, rejects on 'error' or after timeoutMs
+    function waitForEvent(target, event, timeoutMs = 15000) {
+        return new Promise((resolve, reject) => {
+            const done = (fn, arg) => {
+                clearTimeout(timer);
+                target.removeEventListener(event, onEvent);
+                target.removeEventListener('error', onError);
+                fn(arg);
+            };
+            const onEvent = () => done(resolve);
+            const onError = () => done(reject, new Error(`${event} failed`));
+            const timer = setTimeout(() => done(reject, new Error(`${event} timed out`)), timeoutMs);
+            target.addEventListener(event, onEvent);
+            target.addEventListener('error', onError);
+        });
+    }
+
+    // Animated GIF / WebP / APNG through ImageDecoder (Chromium browsers). Returns null for a
+    // still image or when the browser cannot decode it; the caller then loads it as a picture.
+    async function openAnimatedImage(blob) {
+        if (typeof ImageDecoder === 'undefined' || !blob.type) return null;
+        try {
+            if (!(await ImageDecoder.isTypeSupported(blob.type))) return null;
+        } catch (e) {
+            return null;
+        }
+        const decoder = new ImageDecoder({ data: await blob.arrayBuffer(), type: blob.type });
+        try {
+            await decoder.tracks.ready;
+            await decoder.completed; // frameCount of a GIF is final only once all data is parsed
+            const track = decoder.tracks.selectedTrack;
+            if (!track || !track.animated || track.frameCount < 2) {
+                decoder.close();
+                return null;
+            }
+            return { kind: 'image', decoder, frameCount: track.frameCount };
+        } catch (e) {
+            decoder.close();
+            throw e;
+        }
+    }
+
+    // Video: frames are taken `fps` times per second of the clip by seeking
+    async function openVideo(url, fps) {
+        const video = document.createElement('video');
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = 'auto';
+        video.src = url;
+        await waitForEvent(video, 'loadeddata');
+        let duration = video.duration;
+        if (!Number.isFinite(duration)) {
+            // Recorded WebM files often report no duration until the end has been reached
+            video.currentTime = 1e7;
+            await waitForEvent(video, 'seeked');
+            duration = Number.isFinite(video.duration) ? video.duration : video.currentTime;
+        }
+        if (!(duration > 0) || !video.videoWidth) throw new Error('Video has no frames');
+        const anim = { kind: 'video', video, url, duration };
+        setVideoFps(anim, fps);
+        return anim;
+    }
+
+    function setVideoFps(anim, fps) {
+        anim.fps = fps;
+        anim.frameCount = Math.max(1, Math.floor(anim.duration * fps));
+    }
+
+    async function openAnimation(blob) {
+        if (blob.type.startsWith('video/')) {
+            const url = URL.createObjectURL(blob);
+            try {
+                return await openVideo(url, readVideoFps());
+            } catch (e) {
+                URL.revokeObjectURL(url);
+                throw e;
+            }
+        }
+        return openAnimatedImage(blob);
+    }
+
+    function readVideoFps() {
+        const v = parseInt(document.getElementById('db-video-fps')?.value, 10);
+        return isNaN(v) ? 5 : clampInt(v, 1, 30);
+    }
+
+    // Makes anim the current animation; a new id keeps frames of the previous one out of caches
+    function activateAnimation(anim) {
+        closeAnimation();
+        anim.id = ++animationSeq;
+        anim.cache = new Map();
+        anim.queue = Promise.resolve();
+        animation = anim;
+    }
+
+    function closeAnimation() {
+        if (!animation) return;
+        try {
+            if (animation.decoder) animation.decoder.close();
+            if (animation.video) {
+                animation.video.removeAttribute('src');
+                animation.video.load();
+                URL.revokeObjectURL(animation.url);
+            }
+        } catch (e) { }
+        animation = null;
+    }
+
+    async function decodeFrame(anim, index) {
+        const canvas = document.createElement('canvas');
+        if (anim.kind === 'image') {
+            const { image } = await anim.decoder.decode({ frameIndex: index });
+            canvas.width = image.displayWidth;
+            canvas.height = image.displayHeight;
+            canvas.getContext('2d').drawImage(image, 0, 0);
+            image.close();
+        } else {
+            const video = anim.video;
+            // Middle of the frame's time slot
+            const time = Math.min(anim.duration - 0.001, (index + 0.5) / anim.fps);
+            if (Math.abs(video.currentTime - time) > 0.0005) {
+                video.currentTime = time;
+                await waitForEvent(video, 'seeked');
+            }
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+        }
+        return canvas;
+    }
+
+    // Frames are decoded one at a time (a video can only seek to one place at once)
+    function getAnimationFrame(id, index) {
+        const anim = animation;
+        if (!anim || anim.id !== id || !(index >= 0 && index < anim.frameCount)) {
+            return Promise.reject(new Error('Frame is no longer available'));
+        }
+        if (anim.cache.has(index)) return Promise.resolve(anim.cache.get(index));
+        const result = anim.queue.then(() => {
+            if (anim.cache.has(index)) return anim.cache.get(index);
+            return decodeFrame(anim, index).then(canvas => {
+                anim.cache.set(index, canvas);
+                if (anim.cache.size > FRAME_CACHE_SIZE) anim.cache.delete(anim.cache.keys().next().value);
+                return canvas;
+            });
+        });
+        anim.queue = result.catch(() => { });
+        return result;
+    }
+
     function loadImage(url) {
+        const frameRef = parseFrameKey(url);
+        if (frameRef) return getAnimationFrame(frameRef.id, frameRef.index);
         return new Promise((resolve, reject) => {
             const img = new Image();
             img.crossOrigin = 'anonymous';
@@ -1817,9 +1991,8 @@
         };
     }
 
-    // Returns the image as a flat grid of color indices (-1 = transparent) plus the list of
-    // distinct hex colors those indices point to. Every color in the list occurs in the grid.
-    function processImage(img, grid, colorsMode, denoiseLevel) {
+    // The image drawn onto the grid according to the layout, as RGBA pixels
+    function rasterizeImage(img, grid) {
         const w = grid.width;
         const h = grid.height;
         const { unitX, unitY } = grid;
@@ -1849,11 +2022,11 @@
             ctx.drawImage(img, customX / unitX, customY / unitY, customW / unitX, customH / unitY);
         }
 
-        const imgData = ctx.getImageData(0, 0, w, h);
-        const data = imgData.data;
+        return ctx.getImageData(0, 0, w, h).data;
+    }
 
-        // Use 24-bit integers instead of hex string conversions inside 344k loop
-        const colorCounts = new Map();
+    // Adds the opaque colors of RGBA pixels, as 24-bit integers, with their counts to `colorCounts`
+    function countColors(data, colorCounts = new Map()) {
         for (let i = 0; i < data.length; i += 4) {
             const a = data[i + 3];
             if (a < 150) {
@@ -1862,7 +2035,10 @@
             const rgbInt = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
             colorCounts.set(rgbInt, (colorCounts.get(rgbInt) || 0) + 1);
         }
+        return colorCounts;
+    }
 
+    function paletteFor(colorCounts, colorsMode) {
         let palette = [];
         if (colorsMode === 'gartic') {
             palette = GARTIC_PALETTE;
@@ -1882,6 +2058,21 @@
             }));
             palette = quantize(uniqueColors, maxColors);
         }
+        return palette;
+    }
+
+    // Returns the image as a flat grid of color indices (-1 = transparent) plus the list of
+    // distinct hex colors those indices point to. Every color in the list occurs in the grid.
+    function processImage(img, grid, colorsMode, denoiseLevel) {
+        const data = rasterizeImage(img, grid);
+        return mapToPalette(data, grid, paletteFor(countColors(data), colorsMode), denoiseLevel, colorsMode === 'infinite');
+    }
+
+    // Maps RGBA pixels on `grid` to the nearest palette colors. `exact`: the palette holds every
+    // color of the pixels ("No limit"), so the nearest one is the color itself.
+    function mapToPalette(data, grid, palette, denoiseLevel, exact) {
+        const w = grid.width;
+        const h = grid.height;
 
         // Cache hex strings for colors in the palette (typically <= 64, or unique count if infinite)
         const paletteHex = palette.map(c => rgbToHex(c.r, c.g, c.b));
@@ -1890,7 +2081,7 @@
         // Nearest palette entry per distinct color, so the search runs once per color, not per pixel.
         // "No limit" keeps every color as is, so there it is a plain lookup.
         const nearestByColor = new Map();
-        if (colorsMode === 'infinite') {
+        if (exact) {
             palette.forEach((c, i) => nearestByColor.set((c.r << 16) | (c.g << 8) | c.b, i));
         }
 
@@ -2374,7 +2565,10 @@
             fillPPS: readInt('db-fill-pps', FILL_PPS_MAX, 1, FILL_PPS_MAX),
             // "Fast Fill" links each color's islands with invisible bridges; "Fast Fill (old)" sends
             // every island as its own packet, as before them (a fallback if the game ever rejects them)
-            invisibleBridges: drawMode === 'fill'
+            invisibleBridges: drawMode === 'fill',
+            // Draw every Step-th frame of the animation one over another on this canvas
+            allFrames: !!animation && !!el('db-all-frames') && el('db-all-frames').checked,
+            frameStep: readInt('db-frame-step', 1, 1, 1000)
         };
     }
 
@@ -2392,6 +2586,8 @@
     // The preview's plan, reused by Start when nothing that shapes it has changed. Building it is
     // the slow part (up to ~2 s at 1x); its frames only need fresh stroke IDs and the current round.
     let cachedPlan = null;
+    // Canvas size the latest preview was started for
+    let previewCanvasSize = null;
 
     function planKey(opts) {
         return [opts.step, opts.colorsMode, opts.denoiseLevel, opts.fillBg, opts.drawMode,
@@ -2429,6 +2625,121 @@
         return Object.assign({}, plan, { background, steps, nextStrokeId: strokeId });
     }
 
+    // --- All frames on one canvas ---
+    // The album replays a drawing in the order it was drawn, so frames drawn one over another
+    // play the animation there. All frames share one palette (separate palettes would make the
+    // colors flicker), and from frame 2 on only the cells that change are drawn.
+    const ALL_FRAMES_MAX = 200;
+    const CANVAS_WHITE = '#FFFFFF'; // the game's empty canvas
+
+    // Frames 1, 1+step, 1+2·step, ... (0-based indices)
+    function allFramesList(frameCount, step) {
+        const list = [];
+        for (let i = 0; i < frameCount && list.length < ALL_FRAMES_MAX; i += step) list.push(i);
+        return list;
+    }
+
+    // One frame as a grid for buildDrawPlan. `target` and `state` hold global color ids per cell
+    // (what the frame needs and what the canvas already shows); unless `full`, cells that already
+    // show the right color are left out (-1).
+    function frameDeltaProcessed(target, state, base, globalHex, full) {
+        const indices = new Int32Array(target.length);
+        const localIdx = new Map();
+        const colors = [];
+        for (let i = 0; i < target.length; i++) {
+            const g = target[i];
+            if (!full && g === state[i]) {
+                indices[i] = -1;
+                continue;
+            }
+            let c = localIdx.get(g);
+            if (c === undefined) {
+                c = colors.length;
+                colors.push(globalHex[g]);
+                localIdx.set(g, c);
+            }
+            indices[i] = c;
+        }
+        return { indices, colors, width: base.width, height: base.height, cellX: base.cellX, cellY: base.cellY };
+    }
+
+    // A single plan that draws every frame in turn, shaped like buildDrawPlan's (so drawing and
+    // restampPlan work on it as is). Returns null once isStale() says the result is not needed.
+    async function buildAllFramesPlan(anim, opts, canvas, startStrokeId, onProgress, isStale) {
+        const frameList = allFramesList(anim.frameCount, opts.frameStep);
+        const n = frameList.length;
+        const grid = gridFor(opts.step, canvas, opts.invisibleBridges);
+
+        // Pass 1: the colors of all frames, for one shared palette. Frames are not kept (at 1x
+        // 200 of them would take ~250 MB); pass 2 reads them again.
+        const counts = new Map();
+        for (let k = 0; k < n; k++) {
+            onProgress(`Reading frame ${k + 1}/${n}...`);
+            const img = await getAnimationFrame(anim.id, frameList[k]);
+            if (isStale()) return null;
+            countColors(rasterizeImage(img, grid), counts);
+        }
+        const palette = paletteFor(counts, opts.colorsMode);
+
+        // Pass 2: plan each frame against what the canvas shows after the previous one
+        const globalId = new Map([[CANVAS_WHITE, 0]]);
+        const globalHex = [CANVAS_WHITE];
+        let state = new Int32Array(grid.width * grid.height); // empty canvas: all white
+        const plans = [];
+        let strokeId = startStrokeId;
+        for (let k = 0; k < n; k++) {
+            onProgress(`Planning frame ${k + 1}/${n}...`);
+            const img = await getAnimationFrame(anim.id, frameList[k]);
+            if (isStale()) return null;
+            const processed = mapToPalette(rasterizeImage(img, grid), grid, palette, opts.denoiseLevel, opts.colorsMode === 'infinite');
+            const target = new Int32Array(processed.indices.length);
+            for (let i = 0; i < target.length; i++) {
+                const c = processed.indices[i];
+                // Transparent cells are painted white, so they do not keep the previous frame
+                const hex = c >= 0 ? processed.colors[c] : CANVAS_WHITE;
+                let g = globalId.get(hex);
+                if (g === undefined) {
+                    g = globalHex.length;
+                    globalHex.push(hex);
+                    globalId.set(hex, g);
+                }
+                target[i] = g;
+            }
+            // Fill background only for frame 1, which is then drawn in full over the fill
+            const fillBg = k === 0 && opts.fillBg;
+            const frameGrid = frameDeltaProcessed(target, state, processed, globalHex, fillBg);
+            const plan = buildDrawPlan(frameGrid, Object.assign({}, opts, { fillBg, canvas, startStrokeId: strokeId }));
+            strokeId = plan.nextStrokeId;
+            for (const step of plan.steps) step.frameLabel = `Frame ${k + 1}/${n}`;
+            plans.push(plan);
+            state = target;
+        }
+
+        const sum = key => plans.reduce((acc, p) => acc + p[key], 0);
+        return {
+            background: plans[0] ? plans[0].background : null,
+            steps: plans.flatMap(p => p.steps),
+            rectCount: sum('rectCount'),
+            pathCount: sum('pathCount'),
+            packetCount: sum('packetCount'),
+            totalCommands: sum('totalCommands'),
+            nextStrokeId: strokeId,
+            frameCount: n
+        };
+    }
+
+    let cachedAllFramesPlan = null;
+    async function planForAllFrames(anim, opts, canvas, startStrokeId, onProgress, isStale) {
+        const key = [anim.id, anim.frameCount, opts.frameStep, planKey(opts), canvas.width, canvas.height,
+            layoutMode, customX, customY, customW, customH].join('|');
+        if (cachedAllFramesPlan && cachedAllFramesPlan.key === key) {
+            return restampPlan(cachedAllFramesPlan.plan, startStrokeId);
+        }
+        const plan = await buildAllFramesPlan(anim, opts, canvas, startStrokeId, onProgress, isStale);
+        if (plan) cachedAllFramesPlan = { key, plan };
+        return plan;
+    }
+
     // Each call bumps the generation, so a slow older preview cannot overwrite a newer one
     let previewGeneration = 0;
     async function processAndPreviewImage(src) {
@@ -2444,8 +2755,10 @@
             const opts = readDrawOptions();
 
             const planCanvas = planningCanvas();
+            previewCanvasSize = { width: planCanvas.width, height: planCanvas.height };
             const processed = processImageCached(img, src, gridFor(opts.step, planCanvas, opts.invisibleBridges), opts.colorsMode, opts.denoiseLevel);
-            const plan = planFor(processed, opts, planCanvas, 1);
+            // With "All frames" the numbers come from the whole animation, planned further down
+            const plan = opts.allFrames ? null : planFor(processed, opts, planCanvas, 1);
 
             // Render Preview Canvas
             const pCanvas = document.getElementById('db-preview-canvas');
@@ -2469,13 +2782,26 @@
             pCtx.putImageData(pImgData, 0, 0);
             document.getElementById('db-preview-container').style.display = 'flex';
 
-            if (isFillMode(opts.drawMode)) {
+            const frameRef = parseFrameKey(src);
+            const frameInfo = frameRef && animation ? `Frame <b>${frameRef.index + 1}/${animation.frameCount}</b> | ` : '';
+            if (opts.allFrames) {
+                const anim = animation;
+                const allPlan = await planForAllFrames(anim, opts, planCanvas, 1,
+                    msg => { infoEl.textContent = msg; },
+                    () => generation !== previewGeneration || animation !== anim);
+                if (!allPlan) return;
+                const perPacket = isFillMode(opts.drawMode) ? fillIntervalFor(opts.fillPPS) : opts.packetDelay;
+                const count = isFillMode(opts.drawMode) ? allPlan.packetCount : allPlan.totalCommands;
+                const estSec = Math.round((allPlan.totalCommands * perPacket) / 1000);
+                infoEl.innerHTML = `All frames: <b>${allPlan.frameCount}</b> | Packets: <b>${count}</b><br>` +
+                    `~<b>${estSec}s</b> (~${(estSec / allPlan.frameCount).toFixed(1)}s per frame)`;
+            } else if (isFillMode(opts.drawMode)) {
                 const fillInterval = fillIntervalFor(opts.fillPPS);
                 const estSec = Math.round((plan.packetCount * fillInterval) / 1000) + (plan.background ? 1 : 0);
-                infoEl.innerHTML = `Rects: <b>${plan.rectCount}</b> | Packets: <b>${plan.packetCount}</b><br>Speed: <b>${opts.fillPPS} pkt/s</b> (${fillInterval}ms) | ~<b>${estSec}s</b>`;
+                infoEl.innerHTML = `${frameInfo}Rects: <b>${plan.rectCount}</b> | Packets: <b>${plan.packetCount}</b><br>Speed: <b>${opts.fillPPS} pkt/s</b> (${fillInterval}ms) | ~<b>${estSec}s</b>`;
             } else {
                 const estSec = Math.round((plan.totalCommands * opts.packetDelay) / 1000);
-                infoEl.innerHTML = `Rects: <b>${plan.rectCount}</b> | Lines: <b>${plan.pathCount}</b><br>Draw time: <b>~${estSec}s</b>`;
+                infoEl.innerHTML = `${frameInfo}Rects: <b>${plan.rectCount}</b> | Lines: <b>${plan.pathCount}</b><br>Draw time: <b>~${estSec}s</b>`;
             }
             isApplied = true;
         } catch (e) {
@@ -2570,6 +2896,9 @@
         }
 
         const drawTurnId = CFG.currentTurnId;
+        // Fixed for the whole run: a new round may switch the animation frame meanwhile
+        const src = currentImageSrc;
+        const anim = animation;
         let strokeId = strokeIdCounter;
 
         try {
@@ -2590,7 +2919,7 @@
 
             let img;
             try {
-                img = await loadImage(currentImageSrc);
+                img = await loadImage(src);
             } catch (e) {
                 updateStatus('❌ Loading error', '#ef4444');
                 return;
@@ -2598,7 +2927,7 @@
 
             if (!isApplied) {
                 updateStatus('Applying & Rendering Preview...', '#fbbf24');
-                await processAndPreviewImage(currentImageSrc);
+                await processAndPreviewImage(src);
                 if (!isApplied) {
                     updateStatus('❌ Preview render failed', '#ef4444');
                     return;
@@ -2608,8 +2937,18 @@
             }
 
             updateStatus('Processing...', '#fbbf24');
-            const processed = processImageCached(img, currentImageSrc, gridFor(opts.step, canvas, opts.invisibleBridges), opts.colorsMode, opts.denoiseLevel);
-            const plan = planFor(processed, opts, canvas, strokeId);
+            let plan;
+            if (opts.allFrames && anim) {
+                plan = await planForAllFrames(anim, opts, canvas, strokeId,
+                    msg => updateStatus(msg, '#fbbf24'), () => cancelFlag || animation !== anim);
+                if (!plan) {
+                    updateStatus('⏹ Cancelled', '#ef4444');
+                    return;
+                }
+            } else {
+                const processed = processImageCached(img, src, gridFor(opts.step, canvas, opts.invisibleBridges), opts.colorsMode, opts.denoiseLevel);
+                plan = planFor(processed, opts, canvas, strokeId);
+            }
             strokeId = plan.nextStrokeId;
 
             const totalCommands = plan.totalCommands || 1;
@@ -2666,9 +3005,9 @@
             let timerLateness = 0;
             for (let i = 0; i < plan.steps.length; i++) {
                 if (cancelFlag) break;
-                const { hex, frames, commands } = plan.steps[i];
+                const { hex, frames, commands, frameLabel } = plan.steps[i];
 
-                const colorLabel = `Color ${i + 1}/${plan.steps.length} (${hex})`;
+                const colorLabel = frameLabel ? `${frameLabel} (${hex})` : `Color ${i + 1}/${plan.steps.length} (${hex})`;
                 updateStatus(colorLabel, hex);
 
                 if (isFillMode(opts.drawMode)) {
@@ -2783,6 +3122,10 @@
                 denoise: document.getElementById('db-denoise-level')?.value || '0',
                 fillBg: document.getElementById('db-fill-bg')?.checked ?? false,
                 useBridge: document.getElementById('db-use-bridge')?.checked ?? true,
+                frameFollow: document.getElementById('db-frame-follow')?.checked ?? true,
+                frameStep: document.getElementById('db-frame-step')?.value || '1',
+                videoFps: document.getElementById('db-video-fps')?.value || '5',
+                allFrames: document.getElementById('db-all-frames')?.checked ?? false,
                 layoutMode: layoutMode,
                 customX: customX,
                 customY: customY,
@@ -2878,7 +3221,7 @@
             <div id="db-header" style="cursor: move; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 8px; margin-bottom: 12px;">
                 <div style="font-weight: 800; color: #a78bfa; font-size: 14px; display: flex; align-items: center; gap: 6px;">
                     <span class="pulse-dot"></span>
-                    DrawBot 2.0
+                    DrawBot 2.1
                 </div>
                 <button id="db-minimize-btn" style="background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 12px; transition: color 0.2s;">➖</button>
             </div>
@@ -2886,10 +3229,37 @@
             <div id="db-content">
                 <div style="margin-bottom: 12px;">
                     <div style="display: flex; gap: 6px; margin-bottom: 6px;">
-                        <input id="db-url" type="text" placeholder="Image URL, Ctrl+V or drop" style="flex: 1; padding: 8px; background: #1e293b; border: 1px solid #334155; color: white; border-radius: 8px; font-size: 12px; outline: none; transition: border-color 0.2s;">
+                        <input id="db-url" type="text" placeholder="Image/GIF/video URL, Ctrl+V or drop" style="flex: 1; padding: 8px; background: #1e293b; border: 1px solid #334155; color: white; border-radius: 8px; font-size: 12px; outline: none; transition: border-color 0.2s;">
                         <button id="db-file-btn" style="background: #334155; border: 1px solid #475569; color: white; padding: 8px 12px; border-radius: 8px; font-size: 13px; cursor: pointer; transition: background 0.2s;">📁</button>
                     </div>
-                    <input id="db-file" type="file" accept="image/*" style="display: none;">
+                    <input id="db-file" type="file" accept="image/*,video/*" style="display: none;">
+                </div>
+
+                <div id="db-anim" style="display: none; background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 8px; margin-bottom: 12px; font-size: 11px;">
+                    <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 6px;">
+                        <span style="color: #94a3b8;">Frame:</span>
+                        <input type="range" id="db-frame-slider" min="1" max="1" value="1" style="flex: 1; min-width: 0; accent-color: #a78bfa;">
+                        <input type="number" id="db-frame" min="1" max="1" value="1" style="width: 54px; padding: 4px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
+                        <span id="db-frame-count" style="color: #94a3b8; white-space: nowrap;">/ 1</span>
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 6px;">
+                        <label title="Round 1 draws frame 1, round 2 the next frame and so on (by Step). Picking a frame by hand switches this off." style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #94a3b8;">
+                            <input type="checkbox" id="db-frame-follow" checked style="accent-color: #a78bfa; margin: 0;"> Frame follows round
+                        </label>
+                        <span style="color: #94a3b8;" title="Frames to advance per round">Step:
+                            <input type="number" id="db-frame-step" min="1" max="1000" value="1" style="width: 44px; padding: 4px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
+                        </span>
+                    </div>
+                    <label title="Draws every Step-th frame one over another on this canvas. The album replays drawings in the order they were drawn, so it plays the animation. Only the cells that change are drawn from frame 2 on." style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #94a3b8; margin-bottom: 6px;">
+                        <input type="checkbox" id="db-all-frames" style="accent-color: #a78bfa; margin: 0;"> All frames on this canvas (album replay)
+                    </label>
+                    <div id="db-video-fps-row" style="display: none; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <span style="color: #94a3b8;">Video frames per second:</span>
+                        <input type="number" id="db-video-fps" min="1" max="30" value="5" style="width: 44px; padding: 4px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
+                    </div>
+                    <label title="Starts drawing by itself about 2 s after a new round begins. Not saved: switch it on again after reloading." style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #c4b5fd; font-weight: 600;">
+                        <input type="checkbox" id="db-auto-draw" style="accent-color: #a78bfa; margin: 0;"> Auto-draw each new round
+                    </label>
                 </div>
 
                 <div id="db-preview-container" style="display: none; flex-direction: column; align-items: center; background: #0b0f19; border-radius: 10px; padding: 8px; margin-bottom: 12px; border: 1px solid #1e293b;">
@@ -3066,6 +3436,10 @@
             applySavedValue('db-denoise-level', savedSetting.denoise);
             applySavedValue('db-fill-bg', savedSetting.fillBg);
             applySavedValue('db-use-bridge', savedSetting.useBridge);
+            applySavedValue('db-frame-follow', savedSetting.frameFollow);
+            applySavedValue('db-frame-step', savedSetting.frameStep);
+            applySavedValue('db-video-fps', savedSetting.videoFps);
+            applySavedValue('db-all-frames', savedSetting.allFrames);
             // The "Invisible bridges" checkbox became the "Fast Fill (old)" mode
             if (savedSetting.drawMode === 'fill' && savedSetting.invisibleBridges === false) {
                 applySavedValue('db-draw-mode', 'fill_old');
@@ -3114,8 +3488,80 @@
             previewTimer = setTimeout(() => processAndPreviewImage(currentImageSrc), PREVIEW_DEBOUNCE_MS);
         };
 
-        // Single entry point for every image source: file picker, URL, paste, drag & drop
-        const setImageSource = (src, label) => {
+        // --- Animation block: frame picker for GIF / WebP / APNG / video ---
+        const animBox = document.getElementById('db-anim');
+        const frameInput = document.getElementById('db-frame');
+        const frameSlider = document.getElementById('db-frame-slider');
+        const frameCountEl = document.getElementById('db-frame-count');
+        const frameFollow = document.getElementById('db-frame-follow');
+        const frameStepInput = document.getElementById('db-frame-step');
+        const videoFpsRow = document.getElementById('db-video-fps-row');
+        const videoFpsInput = document.getElementById('db-video-fps');
+        const autoDrawBox = document.getElementById('db-auto-draw');
+
+        const readFrameStep = () => {
+            const v = parseInt(frameStepInput.value, 10);
+            return isNaN(v) ? 1 : clampInt(v, 1, 1000);
+        };
+        // Round 1 draws the first frame, every next round moves on by Step, wrapping at the end
+        const frameForRound = () => {
+            if (!animation) return 0;
+            const round = turnIdToRound(CFG.currentTurnId);
+            return ((round - 1) * readFrameStep()) % animation.frameCount;
+        };
+
+        const updateAnimBox = () => {
+            if (!animation) {
+                animBox.style.display = 'none';
+                autoDrawBox.checked = false;
+                return;
+            }
+            animBox.style.display = 'block';
+            videoFpsRow.style.display = animation.kind === 'video' ? 'flex' : 'none';
+            const count = animation.frameCount;
+            frameSlider.max = String(count);
+            frameInput.max = String(count);
+            frameCountEl.textContent = `/ ${count}`;
+            const ref = parseFrameKey(currentImageSrc);
+            const shown = ref && ref.id === animation.id ? ref.index + 1 : 1;
+            frameSlider.value = String(shown);
+            if (document.activeElement !== frameInput) frameInput.value = String(shown);
+        };
+
+        // Shows frame `index` (0-based) of the current animation, keeping the layout as it is
+        const selectFrame = (index) => {
+            if (!animation) return;
+            index = clampInt(index, 0, animation.frameCount - 1);
+            const src = frameKey(animation, index);
+            if (src === currentImageSrc) {
+                updateAnimBox();
+                return;
+            }
+            currentImageSrc = src;
+            isApplied = false;
+            updateAnimBox();
+            loadImage(src).then(img => {
+                if (currentImageSrc !== src) return;
+                draftImg = img;
+                if (layoutMode === 'custom') {
+                    drawDraftPreview();
+                } else {
+                    processAndPreviewImage(src);
+                }
+            }).catch(e => {
+                if (currentImageSrc !== src) return;
+                console.warn('[DrawBot] Could not decode frame:', e);
+                updateStatus(`❌ Could not decode frame ${index + 1}`, '#ef4444');
+            });
+        };
+
+        // Single entry point for every image source: file picker, URL, paste, drag & drop.
+        // A frame key keeps the current animation; anything else replaces it.
+        const setImageSource = (src, label, statusText = 'Image loaded. Click Start.') => {
+            if (!parseFrameKey(src)) {
+                closeAnimation();
+                updateAnimBox();
+            }
             currentImageSrc = src;
             isApplied = false;
             if (label !== undefined) urlInput.value = label;
@@ -3143,7 +3589,8 @@
                 } else {
                     processAndPreviewImage(src);
                 }
-                updateStatus('Image loaded. Click Start.', '#a78bfa');
+                updateStatus(statusText, '#a78bfa');
+                if (animation) updateAnimBox();
             }).catch(() => {
                 if (currentImageSrc !== src) return;
                 // warn, not error: half-typed URLs fail all the time and must not flood the log
@@ -3152,15 +3599,73 @@
             });
         };
 
-        const loadImageFile = (file) => {
-            if (!file || !file.type.startsWith('image/')) {
-                updateStatus('❌ Not an image file', '#ef4444');
+        const isMediaType = type => typeof type === 'string' && (type.startsWith('image/') || type.startsWith('video/'));
+
+        // Each load gets a number, so a slow older load cannot replace a newer one
+        let loadSeq = 0;
+        // Loads a file or a downloaded blob: animations frame by frame, anything else as a picture
+        const loadMediaBlob = async (blob, label) => {
+            if (!blob || !isMediaType(blob.type)) {
+                updateStatus('❌ Not an image or video file', '#ef4444');
                 return;
             }
+            const seq = ++loadSeq;
+            updateStatus(blob.type.startsWith('video/') ? 'Loading video...' : 'Loading image...', '#fbbf24');
+            let anim = null;
+            try {
+                anim = await openAnimation(blob);
+            } catch (e) {
+                console.warn('[DrawBot] Could not open animation:', e);
+            }
+            if (seq !== loadSeq) {
+                if (anim && anim.decoder) anim.decoder.close();
+                if (anim && anim.url) URL.revokeObjectURL(anim.url);
+                return;
+            }
+            if (anim) {
+                activateAnimation(anim);
+                const index = frameFollow.checked ? frameForRound() : 0;
+                const what = anim.kind === 'video' ? 'Video' : 'Animation';
+                setImageSource(frameKey(anim, index), label, `${what} loaded: ${anim.frameCount} frames. Click Start.`);
+                return;
+            }
+            if (blob.type.startsWith('video/')) {
+                updateStatus('❌ Could not read the video. Try another format (MP4 or WebM).', '#ef4444');
+                return;
+            }
+            // GIF/WebP without ImageDecoder (e.g. Firefox): only the first frame can be drawn
+            const animatedType = /^image\/(gif|webp|apng)$/.test(blob.type);
+            const statusText = animatedType && typeof ImageDecoder === 'undefined'
+                ? 'Image loaded (frames need Chrome, Edge or Opera). Click Start.'
+                : undefined;
             const reader = new FileReader();
-            reader.onload = (event) => setImageSource(event.target.result, file.name);
+            reader.onload = (event) => {
+                if (seq === loadSeq) setImageSource(event.target.result, label, statusText);
+            };
             reader.onerror = () => updateStatus('❌ Could not read the file', '#ef4444');
-            reader.readAsDataURL(file);
+            reader.readAsDataURL(blob);
+        };
+
+        const loadImageFile = (file) => {
+            if (!file) return;
+            loadMediaBlob(file, file.name);
+        };
+
+        // A link is downloaded first, so GIFs and videos can be split into frames. When the site
+        // does not allow that, it is loaded as a plain picture, as before.
+        const loadFromUrl = async (url) => {
+            const seq = ++loadSeq;
+            let blob = null;
+            try {
+                const response = await fetch(url);
+                if (response.ok) blob = await response.blob();
+            } catch (e) { }
+            if (seq !== loadSeq) return;
+            if (blob && isMediaType(blob.type)) {
+                loadMediaBlob(blob, url);
+            } else {
+                setImageSource(url, url);
+            }
         };
 
         // File loading
@@ -3179,7 +3684,7 @@
             urlTimer = setTimeout(() => {
                 const val = urlInput.value.trim();
                 if (val && (val.startsWith('http') || val.startsWith('data:'))) {
-                    setImageSource(val);
+                    loadFromUrl(val);
                 }
             }, PREVIEW_DEBOUNCE_MS);
         });
@@ -3210,16 +3715,17 @@
             panel.classList.remove('db-drop-active');
             const dt = e.dataTransfer;
             if (!dt) return;
-            const file = Array.from(dt.files || []).find(f => f.type.startsWith('image/'));
+            const file = Array.from(dt.files || []).find(f => isMediaType(f.type));
             if (file) {
                 loadImageFile(file);
                 return;
             }
             const url = (dt.getData('text/uri-list') || dt.getData('text/plain') || '').split('\n')[0].trim();
             if (url.startsWith('http') || url.startsWith('data:')) {
-                setImageSource(url, url);
+                urlInput.value = url;
+                loadFromUrl(url);
             } else {
-                updateStatus('❌ Drop an image file or an image link', '#ef4444');
+                updateStatus('❌ Drop an image, GIF or video file, or a link to one', '#ef4444');
             }
         });
 
@@ -3241,6 +3747,54 @@
         ['db-batch-size', 'db-delay', 'db-fill-pps'].forEach(id => {
             document.getElementById(id).addEventListener('input', handleTriggerUpdate);
         });
+
+        // Picking a frame by hand stops it from following the round
+        const pickFrameByHand = (value) => {
+            const frame = parseInt(value, 10);
+            if (isNaN(frame) || !animation) return;
+            if (frameFollow.checked) {
+                frameFollow.checked = false;
+                saveSettings();
+            }
+            selectFrame(frame - 1);
+        };
+        frameSlider.addEventListener('input', () => pickFrameByHand(frameSlider.value));
+        frameInput.addEventListener('input', () => pickFrameByHand(frameInput.value));
+        frameFollow.addEventListener('change', () => {
+            saveSettings();
+            if (frameFollow.checked) selectFrame(frameForRound());
+        });
+        frameStepInput.addEventListener('input', () => {
+            saveSettings();
+            if (frameFollow.checked) selectFrame(frameForRound());
+            if (document.getElementById('db-all-frames').checked) handleTriggerUpdate();
+        });
+        document.getElementById('db-all-frames').addEventListener('change', handleTriggerUpdate);
+        videoFpsInput.addEventListener('change', () => {
+            saveSettings();
+            if (!animation || animation.kind !== 'video') return;
+            // Same video, new frame numbering: frames get a new id and a fresh cache
+            const time = ((parseFrameKey(currentImageSrc)?.index ?? 0) + 0.5) / animation.fps;
+            animation.id = ++animationSeq;
+            animation.cache = new Map();
+            setVideoFps(animation, readVideoFps());
+            updateStatus(`Video: ${animation.frameCount} frames. Click Start.`, '#a78bfa');
+            selectFrame(frameFollow.checked ? frameForRound() : Math.floor(time * animation.fps));
+        });
+
+        // Auto-draw: each round is drawn once, ROUND_SETTLE_MS after it was seen to begin, so
+        // the game has switched to the new canvas. Switched on while a drawing canvas is on
+        // screen, it leaves that round to Start and begins with the next one.
+        const ROUND_SETTLE_MS = 2000;
+        let roundChangedAt = 0;
+        let autoDrawnTurn = null;
+        autoDrawBox.addEventListener('change', () => {
+            autoDrawnTurn = autoDrawBox.checked && getGameCanvas() ? CFG.currentTurnId : null;
+        });
+        onRoundChanged = () => {
+            roundChangedAt = performance.now();
+            if (animation && frameFollow.checked) selectFrame(frameForRound());
+        };
 
         // Show/hide PPS and Delay depending on drawing mode
         const drawModeSelect = document.getElementById('db-draw-mode');
@@ -3371,8 +3925,19 @@
         // Start will send (otherwise Start rebuilds the plan, which takes up to ~2 s at 1x)
         setInterval(() => {
             const canvas = getGameCanvas();
+            if (autoDrawBox.checked && animation && canvas && wsInstance && !isDrawing &&
+                autoDrawnTurn !== CFG.currentTurnId && performance.now() - roundChangedAt > ROUND_SETTLE_MS) {
+                autoDrawnTurn = CFG.currentTurnId;
+                const frame = (parseFrameKey(currentImageSrc)?.index ?? 0) + 1;
+                console.log(`[DrawBot] Auto-draw: round ${turnIdToRound(CFG.currentTurnId)}, frame ${frame}`);
+                runDraw();
+                return;
+            }
             if (!canvas || isDrawing || !currentImageSrc || layoutMode === 'custom') return;
-            if (cachedPlan && cachedPlan.width === canvas.width && cachedPlan.height === canvas.height) return;
+            // Compared with the size the last preview started for, not with a finished plan: an
+            // "All frames" preview has no single-frame plan and takes a while, and restarting it
+            // every second kept it from ever finishing
+            if (previewCanvasSize && previewCanvasSize.width === canvas.width && previewCanvasSize.height === canvas.height) return;
             rememberCanvasSize(canvas);
             isApplied = false;
             schedulePreview();
