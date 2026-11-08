@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gartic Phone DrawBot
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.1.1
 // @description  Automated drawing bot with WebSocket interception, image, GIF and video loading, color quantization, preview and progress indicator
 // @author       NotLun1x
 // @match        https://garticphone.com/*
@@ -2568,7 +2568,9 @@
             invisibleBridges: drawMode === 'fill',
             // Draw every Step-th frame of the animation one over another on this canvas
             allFrames: !!animation && !!el('db-all-frames') && el('db-all-frames').checked,
-            frameStep: readInt('db-frame-step', 1, 1, 1000)
+            frameStep: readInt('db-frame-step', 1, 1, 1000),
+            // With allFrames: a palette per frame instead of one shared by all frames
+            framePalette: !!el('db-frame-palette') && el('db-frame-palette').checked
         };
     }
 
@@ -2627,8 +2629,9 @@
 
     // --- All frames on one canvas ---
     // The album replays a drawing in the order it was drawn, so frames drawn one over another
-    // play the animation there. All frames share one palette (separate palettes would make the
-    // colors flicker), and from frame 2 on only the cells that change are drawn.
+    // play the animation there. By default all frames share one palette (separate palettes can make
+    // the colors flicker); "Own palette for each frame" gives each its own. From frame 2 on only
+    // the cells that change are drawn.
     const ALL_FRAMES_MAX = 200;
     const CANVAS_WHITE = '#FFFFFF'; // the game's empty canvas
 
@@ -2671,15 +2674,19 @@
         const grid = gridFor(opts.step, canvas, opts.invisibleBridges);
 
         // Pass 1: the colors of all frames, for one shared palette. Frames are not kept (at 1x
-        // 200 of them would take ~250 MB); pass 2 reads them again.
-        const counts = new Map();
-        for (let k = 0; k < n; k++) {
-            onProgress(`Reading frame ${k + 1}/${n}...`);
-            const img = await getAnimationFrame(anim.id, frameList[k]);
-            if (isStale()) return null;
-            countColors(rasterizeImage(img, grid), counts);
+        // 200 of them would take ~250 MB); pass 2 reads them again. Not needed when each frame
+        // gets its own palette.
+        let sharedPalette = null;
+        if (!opts.framePalette) {
+            const counts = new Map();
+            for (let k = 0; k < n; k++) {
+                onProgress(`Reading frame ${k + 1}/${n}...`);
+                const img = await getAnimationFrame(anim.id, frameList[k]);
+                if (isStale()) return null;
+                countColors(rasterizeImage(img, grid), counts);
+            }
+            sharedPalette = paletteFor(counts, opts.colorsMode);
         }
-        const palette = paletteFor(counts, opts.colorsMode);
 
         // Pass 2: plan each frame against what the canvas shows after the previous one
         const globalId = new Map([[CANVAS_WHITE, 0]]);
@@ -2691,7 +2698,9 @@
             onProgress(`Planning frame ${k + 1}/${n}...`);
             const img = await getAnimationFrame(anim.id, frameList[k]);
             if (isStale()) return null;
-            const processed = mapToPalette(rasterizeImage(img, grid), grid, palette, opts.denoiseLevel, opts.colorsMode === 'infinite');
+            const data = rasterizeImage(img, grid);
+            const palette = sharedPalette || paletteFor(countColors(data), opts.colorsMode);
+            const processed = mapToPalette(data, grid, palette, opts.denoiseLevel, opts.colorsMode === 'infinite');
             const target = new Int32Array(processed.indices.length);
             for (let i = 0; i < target.length; i++) {
                 const c = processed.indices[i];
@@ -2730,7 +2739,7 @@
 
     let cachedAllFramesPlan = null;
     async function planForAllFrames(anim, opts, canvas, startStrokeId, onProgress, isStale) {
-        const key = [anim.id, anim.frameCount, opts.frameStep, planKey(opts), canvas.width, canvas.height,
+        const key = [anim.id, anim.frameCount, opts.frameStep, opts.framePalette, planKey(opts), canvas.width, canvas.height,
             layoutMode, customX, customY, customW, customH].join('|');
         if (cachedAllFramesPlan && cachedAllFramesPlan.key === key) {
             return restampPlan(cachedAllFramesPlan.plan, startStrokeId);
@@ -3126,6 +3135,7 @@
                 frameStep: document.getElementById('db-frame-step')?.value || '1',
                 videoFps: document.getElementById('db-video-fps')?.value || '5',
                 allFrames: document.getElementById('db-all-frames')?.checked ?? false,
+                framePalette: document.getElementById('db-frame-palette')?.checked ?? false,
                 layoutMode: layoutMode,
                 customX: customX,
                 customY: customY,
@@ -3221,7 +3231,7 @@
             <div id="db-header" style="cursor: move; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255, 255, 255, 0.1); padding-bottom: 8px; margin-bottom: 12px;">
                 <div style="font-weight: 800; color: #a78bfa; font-size: 14px; display: flex; align-items: center; gap: 6px;">
                     <span class="pulse-dot"></span>
-                    DrawBot 2.1
+                    DrawBot 2.1.1
                 </div>
                 <button id="db-minimize-btn" style="background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 12px; transition: color 0.2s;">➖</button>
             </div>
@@ -3257,8 +3267,8 @@
                         <span style="color: #94a3b8;">Video frames per second:</span>
                         <input type="number" id="db-video-fps" min="1" max="30" value="5" style="width: 44px; padding: 4px; background: #1e293b; color: white; border: 1px solid #334155; border-radius: 6px; font-size: 11px; outline: none; text-align: center; font-weight: 600;">
                     </div>
-                    <label title="Starts drawing by itself about 2 s after a new round begins. Not saved: switch it on again after reloading." style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #c4b5fd; font-weight: 600;">
-                        <input type="checkbox" id="db-auto-draw" style="accent-color: #a78bfa; margin: 0;"> Auto-draw each new round
+                    <label id="db-frame-palette-label" title="With All frames: each frame picks its own colors instead of one palette for all frames. Frames look closer to the source, but colors may flicker between frames and more cells get redrawn. Makes no difference with Gartic (fixed) or No limit colors." style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #94a3b8;">
+                        <input type="checkbox" id="db-frame-palette" style="accent-color: #a78bfa; margin: 0;"> Own palette for each frame
                     </label>
                 </div>
 
@@ -3440,6 +3450,7 @@
             applySavedValue('db-frame-step', savedSetting.frameStep);
             applySavedValue('db-video-fps', savedSetting.videoFps);
             applySavedValue('db-all-frames', savedSetting.allFrames);
+            applySavedValue('db-frame-palette', savedSetting.framePalette);
             // The "Invisible bridges" checkbox became the "Fast Fill (old)" mode
             if (savedSetting.drawMode === 'fill' && savedSetting.invisibleBridges === false) {
                 applySavedValue('db-draw-mode', 'fill_old');
@@ -3497,7 +3508,6 @@
         const frameStepInput = document.getElementById('db-frame-step');
         const videoFpsRow = document.getElementById('db-video-fps-row');
         const videoFpsInput = document.getElementById('db-video-fps');
-        const autoDrawBox = document.getElementById('db-auto-draw');
 
         const readFrameStep = () => {
             const v = parseInt(frameStepInput.value, 10);
@@ -3513,7 +3523,6 @@
         const updateAnimBox = () => {
             if (!animation) {
                 animBox.style.display = 'none';
-                autoDrawBox.checked = false;
                 return;
             }
             animBox.style.display = 'block';
@@ -3702,6 +3711,23 @@
             loadImageFile(imageItem.getAsFile());
         }, true);
 
+        // A file dropped outside the panel made the browser open it in place of the game, and the
+        // game then asked "Leave site? Changes you made may not be saved". Files dropped anywhere
+        // on the page are loaded instead; other drags (text, the game's own) are left alone.
+        const isFileDrag = (e) => !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+        window.addEventListener('dragover', (e) => {
+            if (!isFileDrag(e) || panel.contains(e.target)) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+        });
+        window.addEventListener('drop', (e) => {
+            if (!isFileDrag(e) || panel.contains(e.target)) return;
+            e.preventDefault();
+            const file = Array.from(e.dataTransfer.files || []).find(f => isMediaType(f.type));
+            if (file) loadImageFile(file);
+            else updateStatus('❌ Drop an image, GIF or video file, or a link to one', '#ef4444');
+        });
+
         // Drag & drop an image file, or an image dragged from another tab, onto the panel
         panel.addEventListener('dragover', (e) => {
             e.preventDefault();
@@ -3769,7 +3795,21 @@
             if (frameFollow.checked) selectFrame(frameForRound());
             if (document.getElementById('db-all-frames').checked) handleTriggerUpdate();
         });
-        document.getElementById('db-all-frames').addEventListener('change', handleTriggerUpdate);
+        // "Own palette for each frame" only matters with All frames: greyed out otherwise
+        const allFramesBox = document.getElementById('db-all-frames');
+        const framePaletteBox = document.getElementById('db-frame-palette');
+        const framePaletteLabel = document.getElementById('db-frame-palette-label');
+        const syncFramePalette = () => {
+            framePaletteBox.disabled = !allFramesBox.checked;
+            framePaletteLabel.style.opacity = allFramesBox.checked ? '1' : '0.45';
+            framePaletteLabel.style.cursor = allFramesBox.checked ? 'pointer' : 'default';
+        };
+        syncFramePalette();
+        allFramesBox.addEventListener('change', () => {
+            syncFramePalette();
+            handleTriggerUpdate();
+        });
+        framePaletteBox.addEventListener('change', handleTriggerUpdate);
         videoFpsInput.addEventListener('change', () => {
             saveSettings();
             if (!animation || animation.kind !== 'video') return;
@@ -3782,17 +3822,7 @@
             selectFrame(frameFollow.checked ? frameForRound() : Math.floor(time * animation.fps));
         });
 
-        // Auto-draw: each round is drawn once, ROUND_SETTLE_MS after it was seen to begin, so
-        // the game has switched to the new canvas. Switched on while a drawing canvas is on
-        // screen, it leaves that round to Start and begins with the next one.
-        const ROUND_SETTLE_MS = 2000;
-        let roundChangedAt = 0;
-        let autoDrawnTurn = null;
-        autoDrawBox.addEventListener('change', () => {
-            autoDrawnTurn = autoDrawBox.checked && getGameCanvas() ? CFG.currentTurnId : null;
-        });
         onRoundChanged = () => {
-            roundChangedAt = performance.now();
             if (animation && frameFollow.checked) selectFrame(frameForRound());
         };
 
@@ -3925,14 +3955,6 @@
         // Start will send (otherwise Start rebuilds the plan, which takes up to ~2 s at 1x)
         setInterval(() => {
             const canvas = getGameCanvas();
-            if (autoDrawBox.checked && animation && canvas && wsInstance && !isDrawing &&
-                autoDrawnTurn !== CFG.currentTurnId && performance.now() - roundChangedAt > ROUND_SETTLE_MS) {
-                autoDrawnTurn = CFG.currentTurnId;
-                const frame = (parseFrameKey(currentImageSrc)?.index ?? 0) + 1;
-                console.log(`[DrawBot] Auto-draw: round ${turnIdToRound(CFG.currentTurnId)}, frame ${frame}`);
-                runDraw();
-                return;
-            }
             if (!canvas || isDrawing || !currentImageSrc || layoutMode === 'custom') return;
             // Compared with the size the last preview started for, not with a finished plan: an
             // "All frames" preview has no single-frame plan and takes a while, and restarting it

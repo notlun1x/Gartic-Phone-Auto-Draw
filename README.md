@@ -33,7 +33,7 @@
 ## What's New in 2.1
 
 - 🎞 **GIFs, animated WebP/PNG and videos** — load an animation and the bot draws it frame by frame: frame 1 in round 1, frame 2 in round 2 and so on. In the game's **Animation** mode use `Standard Lines`: that mode has no fill tool, so Fast Fill does not work there. See [Animations](#animations-gif-webp-and-video)
-- 🤖 **Auto-draw** — optionally starts drawing the next frame by itself when a new round begins
+- 🎨 **Own palette for each frame** — with *All frames*, each frame can pick its own colors instead of sharing one palette
 - 📼 **All frames on one canvas** — draws the whole animation in a single round, frame over frame. The album replays drawings in the order they were drawn, so the replay plays the animation
 
 ---
@@ -51,8 +51,8 @@
 
 ## Features
 
-- 🖼 **Any image source** — a local file, an image URL, **Ctrl+V** from the clipboard, or drag & drop onto the panel
-- 🎞 **Animations** — GIF, animated WebP/PNG and video (MP4, WebM) are drawn frame by frame, one frame per round, with optional auto-draw
+- 🖼 **Any image source** — a local file, an image URL, **Ctrl+V** from the clipboard, or drag & drop anywhere on the page
+- 🎞 **Animations** — GIF, animated WebP/PNG and video (MP4, WebM) are drawn frame by frame, one frame per round or all frames on one canvas
 - ⚡ **Fast Fill** — uses the game's own fill tool (Tool 8) and sends about one packet per color
 - 🎨 **Flexible colors** — the game palette (18 colors), True Color with 8–256 colors, or every color as is
 - 🌉 **Smart Bridges** — joins the remaining islands of a color through areas that are painted over later, and picks the color order that leaves the fewest islands
@@ -115,7 +115,7 @@ Tampermonkey checks installed scripts for updates on its own (about once a day b
    - click 📁 to pick a local file, **or**
    - paste an image URL into the text field, **or**
    - press **Ctrl+V** anywhere on the page to paste an image from the clipboard, **or**
-   - drag an image file (or an image from another tab) onto the panel
+   - drag an image file anywhere on the page (or an image from another tab onto the panel)
 4. **Check the preview** and adjust the settings if needed. The line under the preview shows what will be sent, for example:
    `Rects: 41250 | Packets: 33` — `Speed: 8 pkt/s (135ms) | ~5s`
 5. **Click ▶ Start Drawing**. The status shows the current color and the real sending speed
@@ -143,18 +143,18 @@ Load a GIF, an animated WebP/PNG or a video (MP4, WebM) the same way as a pictur
 | **Step** | How many frames to move on per round (or, with *All frames*, which frames to draw: every Step-th). With a 60-frame GIF and 10 rounds, Step 6 spreads the rounds over the whole animation |
 | **All frames on this canvas (album replay)** | Draws frames 1, 1+Step, 1+2·Step, … one over another on the current canvas (at most 200). The preview shows the total packets and time |
 | **Video frames per second** | Videos only: how many frames are taken from each second of the clip (1–30, default 5). A 10-second clip at 5 gives 50 frames |
-| **Auto-draw each new round** | Starts drawing by itself about 2 s after a new round begins, so you only have to click **Done**. Switched on during a drawing round, it starts with the next round. Off after every page reload |
+| **Own palette for each frame** | With *All frames* only: each frame gets its own N colors instead of one palette for the whole animation. Frames look closer to the source when the colors change a lot (fades, color cycling), but colors may flicker and more cells get redrawn, so it takes more packets. No effect with `Game palette` or `No limit`. Off by default |
 
 > ⚠️ **The game's Animation mode has no fill tool**, so `Fast Fill` and `Fast Fill (old)` draw nothing there. Switch **Mode** to `Standard Lines` for it. Lines need far more packets than fills, so pick a coarse **Scale** (4x or more) and few colors (the game palette or True Color 8–16), and check the time in the preview so a frame fits into the round.
 
 **All frames on one canvas.** The album shows a replay of how each drawing was made, so a drawing made of frames drawn one over another plays as an animation there. It is meant for the regular game modes with `Fast Fill`; with `Standard Lines` even a few frames rarely fit into a round. To keep it cheap:
-- all frames share one palette, so colors do not flicker between frames;
+- all frames share one palette, so colors do not flicker between frames (turn on *Own palette for each frame* when the frames' colors differ too much for one palette);
 - from frame 2 on only the cells that change are drawn, so a still background costs nothing after frame 1;
 - transparent parts are painted white, so they do not keep the previous frame.
 
 Each frame still takes about one packet per color that changes, so the round timer is the limit: 12 frames of a simple GIF at 32 colors take ~45 s. Use fewer colors, a larger Step or a coarser Scale for longer animations. How smoothly the album replays it is up to the game.
 
-Typical use in the game's **Animation** mode: load the GIF before the game starts, set **Mode** to `Standard Lines` with a coarse **Scale** and few colors, check that the **Round** field matches the game, turn on **Auto-draw**, and click **Done** after each frame.
+Typical use in the game's **Animation** mode: load the GIF before the game starts, set **Mode** to `Standard Lines` with a coarse **Scale** and few colors, check that the **Round** field matches the game, then click **Start** and **Done** in each round.
 
 Frames of GIF/WebP/PNG are decoded with the browser's `ImageDecoder`, which Chrome, Edge and Opera have. In other browsers an animated image is drawn as a still picture (its first frame). Videos work in every browser that can play them.
 
@@ -228,6 +228,7 @@ Very large colors (over 12000 rectangles, usually at 1x) take an extra packet ea
 | A GIF loads as a still picture | Your browser has no `ImageDecoder` (e.g. Firefox). Use Chrome, Edge or Opera, or convert the animation to MP4/WebM |
 | A video from a link does not load | The site does not allow downloading it from another page. Download the video and load it with 📁 |
 | `⚠ … packets failed to send` | The connection was unstable; draw again on a new round or lower **Packets/s** |
+| The browser asks "Leave site? Changes you made may not be saved" | The game asks this when the page is about to close or reload. Older versions let a file dropped next to the panel open in the tab, which triggered it: click **Cancel** to stay in the game, and update the script. Now a file dropped anywhere on the page is loaded into the bot |
 | Start waits a moment before sending | The plan is being made (up to ~2 s at 1x with many colors). Normally it is ready from the preview |
 
 ---
@@ -332,7 +333,7 @@ Every drawing packet looks like this:
 ## Что нового в 2.1
 
 - 🎞 **GIF, анимированные WebP/PNG и видео** — загрузите анимацию, и бот нарисует её по кадрам: кадр 1 в раунде 1, кадр 2 в раунде 2 и так далее. В режиме игры **Анимация** используйте `Standard Lines`: в этом режиме нет заливки, поэтому Fast Fill там не работает. См. [Анимации](#анимации-gif-webp-и-видео)
-- 🤖 **Авторисование** — по желанию бот сам начинает рисовать следующий кадр, когда начинается новый раунд
+- 🎨 **Своя палитра у каждого кадра** — с *All frames* каждый кадр может подбирать свои цвета, а не делить одну палитру на всех
 - 📼 **Все кадры на одном холсте** — рисует всю анимацию за один раунд, кадр поверх кадра. Альбом проигрывает рисунки в том порядке, в котором их рисовали, поэтому повтор показывает анимацию
 
 ---
@@ -351,7 +352,7 @@ Every drawing packet looks like this:
 ## Возможности
 
 - 🖼 **Любой источник картинки** — локальный файл, ссылка на изображение, **Ctrl+V** из буфера обмена или перетаскивание на панель
-- 🎞 **Анимации** — GIF, анимированные WebP/PNG и видео (MP4, WebM) рисуются по кадрам, по кадру за раунд, с возможностью авторисования
+- 🎞 **Анимации** — GIF, анимированные WebP/PNG и видео (MP4, WebM) рисуются по кадрам, по кадру за раунд или все кадры на одном холсте
 - ⚡ **Fast Fill** — использует инструмент заливки самой игры (Tool 8) и отправляет примерно один пакет на цвет
 - 🎨 **Гибкая работа с цветами** — палитра игры (18 цветов), True Color на 8–256 цветов или все цвета как есть
 - 🌉 **Умные мосты** — соединяют оставшиеся островки цвета через области, которые позже закрасятся, и подбирают порядок цветов, при котором островков меньше всего
@@ -416,7 +417,7 @@ Tampermonkey сам проверяет обновления установлен
    - нажмите 📁 и выберите файл, **или**
    - вставьте ссылку на изображение в текстовое поле, **или**
    - нажмите **Ctrl+V** в любом месте страницы, чтобы вставить картинку из буфера обмена, **или**
-   - перетащите файл изображения (или картинку из другой вкладки) на панель
+   - перетащите файл изображения в любое место страницы (или картинку из другой вкладки на панель)
 4. **Проверьте превью** и при необходимости поменяйте настройки. Строка под превью показывает, что будет отправлено, например:
    `Rects: 41250 | Packets: 33` — `Speed: 8 pkt/s (135ms) | ~5s`
 5. **Нажмите ▶ Start Drawing**. В статусе видно текущий цвет и реальную скорость отправки
@@ -444,18 +445,18 @@ GIF, анимированный WebP/PNG или видео (MP4, WebM) загр�
 | **Step** (шаг) | На сколько кадров сдвигаться за раунд (а с *All frames* — какие кадры рисовать: каждый Step-й). Для GIF из 60 кадров и 10 раундов шаг 6 растянет раунды на всю анимацию |
 | **All frames on this canvas (album replay)** | Рисует кадры 1, 1+Step, 1+2·Step, … друг поверх друга на текущем холсте (не больше 200). Превью показывает общее число пакетов и время |
 | **Video frames per second** | Только для видео: сколько кадров брать из каждой секунды ролика (1–30, по умолчанию 5). Ролик на 10 секунд при 5 даёт 50 кадров |
-| **Auto-draw each new round** (авторисование) | Сам начинает рисовать примерно через 2 с после начала нового раунда, остаётся только нажимать **Готово**. Если включить во время раунда рисования, начнёт со следующего раунда. После перезагрузки страницы выключено |
+| **Own palette for each frame** (своя палитра у кадра) | Только с *All frames*: у каждого кадра свои N цветов вместо одной палитры на всю анимацию. Кадры ближе к оригиналу, когда цвета сильно меняются (затемнения, перелив цветов), но цвета могут мерцать и перерисовывается больше клеток, поэтому пакетов больше. С `Game palette` и `No limit` ничего не меняет. По умолчанию выключено |
 
 > ⚠️ **В режиме игры «Анимация» нет заливки**, поэтому `Fast Fill` и `Fast Fill (old)` там ничего не рисуют. Для него переключите **Mode** на `Standard Lines`. Линиям нужно намного больше пакетов, чем заливке, поэтому берите крупный **Scale** (4x и больше) и мало цветов (палитра игры или True Color 8–16) и проверяйте время в превью, чтобы кадр успевал за раунд.
 
 **Все кадры на одном холсте.** Альбом показывает повтор того, как рисовался каждый рисунок, поэтому рисунок из кадров, нарисованных друг поверх друга, проигрывается там как анимация. Это рассчитано на обычные режимы игры с `Fast Fill`; со `Standard Lines` даже несколько кадров редко успевают за раунд. Чтобы это было дёшево:
-- у всех кадров одна общая палитра, поэтому цвета не мерцают между кадрами;
+- у всех кадров одна общая палитра, поэтому цвета не мерцают между кадрами (включите *Own palette for each frame*, если цвета кадров слишком разные для одной палитры);
 - начиная со второго кадра рисуются только клетки, которые изменились, поэтому неподвижный фон после первого кадра ничего не стоит;
 - прозрачные части закрашиваются белым, чтобы на них не оставался предыдущий кадр.
 
 Каждый кадр всё равно занимает примерно пакет на каждый изменившийся цвет, поэтому ограничение — таймер раунда: 12 кадров простой GIF на 32 цвета занимают ~45 с. Для длинных анимаций берите меньше цветов, больший Step или крупнее масштаб. Насколько плавно альбом это проиграет, зависит от игры.
 
-Как обычно пользоваться в режиме игры **Анимация**: загрузите GIF до начала игры, поставьте **Mode** на `Standard Lines` с крупным **Scale** и малым числом цветов, проверьте, что поле **Round** совпадает с раундом в игре, включите **Auto-draw** и нажимайте **Готово** после каждого кадра.
+Как обычно пользоваться в режиме игры **Анимация**: загрузите GIF до начала игры, поставьте **Mode** на `Standard Lines` с крупным **Scale** и малым числом цветов, проверьте, что поле **Round** совпадает с раундом в игре, и в каждом раунде нажимайте **Start**, а затем **Готово**.
 
 Кадры GIF/WebP/PNG декодируются через браузерный `ImageDecoder`, который есть в Chrome, Edge и Opera. В других браузерах анимированная картинка рисуется как обычная (первый кадр). Видео работает в любом браузере, который умеет его воспроизводить.
 
@@ -529,6 +530,7 @@ GIF, анимированный WebP/PNG или видео (MP4, WebM) загр�
 | GIF загружается как обычная картинка | В браузере нет `ImageDecoder` (например, Firefox). Используйте Chrome, Edge или Opera или переведите анимацию в MP4/WebM |
 | Видео по ссылке не загружается | Сайт не разрешает скачивать его с других страниц. Скачайте видео и загрузите через 📁 |
 | `⚠ … packets failed to send` | Соединение было нестабильным; нарисуйте заново в следующем раунде или уменьшите **Packets/s** |
+| Браузер спрашивает «Покинуть сайт? Возможно, внесённые изменения не сохранятся» | Так игра реагирует, когда страница вот-вот закроется или перезагрузится. В старых версиях файл, брошенный рядом с панелью, открывался во вкладке вместо игры и вызывал этот вопрос: нажмите **Отмена**, чтобы остаться в игре, и обновите скрипт. Теперь файл, брошенный в любое место страницы, загружается в бот |
 | После Start бот немного ждёт перед отправкой | Строится план (до ~2 с на 1x с большим числом цветов). Обычно он уже готов после превью |
 
 ---
